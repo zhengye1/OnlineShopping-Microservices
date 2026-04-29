@@ -360,12 +360,122 @@ flowchart TB
 
 ## 9. Homework / Reflection
 
-完 lesson 之前自問：
+> 自己諗完先 expand 答案。
 
-1. 你 monolith `Order.java` 入面有冇 reference 到 `User` / `Product` entity？拆咗之後點處理？
-2. 「Cart 用 DynamoDB」呢個決定，CAP 角度同 access pattern 角度點 justify？
-3. 你公司面試時被問 "what's hardest about microservices"，你會答邊 3 點？
-4. 「shared domain model」反 pattern 你而家 monolith 有冇類似情況？
+### 1. 你 monolith `Order.java` 入面有冇 reference 到 `User` / `Product` entity？拆咗之後點處理？
+
+<details>
+<summary>📝 Solution</summary>
+
+Monolith 真實情況：`Order` 有 `@ManyToOne User user;` + `@OneToMany List<OrderItem> items;`，`OrderItem` 有 `@ManyToOne Product product;` — 全部係 cross-service references。
+
+**Microservices 處理**：唔再用 JPA relationship，改成 plain ID column + snapshot：
+
+| Monolith | Microservices |
+|----------|---------------|
+| `@ManyToOne User user;` | `private Long userId;` |
+| `OrderItem.product → Product` | `OrderItem` 自己存 `productId` + `productNameSnapshot`, `priceSnapshot`, `imageUrlSnapshot` |
+
+**點解 OrderItem 要 snapshot 而唔係 live join？**
+- 用戶查歷史 order 想睇**買嘅嗰一刻嘅樣** — product 改名 / 改價之後，舊 order 唔應該變
+- 法律 / 會計上，receipt 必須係 immutable historical record
+- Snapshot = denormalization on purpose（by design，唔係 anti-pattern）
+
+**需要 user 詳情點處理？**（admin 想睇 order 對應 user email）
+- API composition：order-service controller call user-service Feign client 拎 `User` → enrich response
+- 唔好喺 DB level 跨 service join
+
+**Black Friday 高 QPS 用 API composition 會 N+1，點解？**
+- 100 orders → 100 個 user lookup call = 浪費
+- Solution: user-service 暴露 batch endpoint `POST /users/_bulk { ids: [...] }` 一次拎 100 個
+- 或者 Redis cache hot user，TTL 1 分鐘
+- → L10 (OpenFeign) + L24 (caching) 親手寫
+
+**Mindset 改變**：唔係「好煩」，係由「default join」變「default denormalize + 必要先 enrich」。
+
+</details>
+
+---
+
+### 2. 「Cart 用 DynamoDB」呢個決定，CAP 角度同 access pattern 角度點 justify？
+
+<details>
+<summary>📝 Solution</summary>
+
+Interview 想聽 4-5 條完整 justification：
+
+| 角度 | 答法 |
+|------|------|
+| **CAP** | Cart **per-user**（單一寫者：用戶自己），AP 完全足夠 — 1-2 秒 stale 都唔會察覺；MySQL 嘅 CP 對 cart 來講 overkill |
+| **Access pattern** | 100% 單 partition key (`USER#<userId>`) lookup — 永遠 O(1)，無需 join；KV store 設計嘅 sweet spot |
+| **Scale** | 1M users 嘅 cart_item table 喺 MySQL 入面 connection pool / query plan / index 都係挑戰；DynamoDB 自動 sharding by partition key，水平擴展冇上限 |
+| **Built-in features** | DynamoDB **TTL attribute** — 30 日無動 cart 自動 purge，零 cron job；MySQL 要寫 cleanup script |
+| **Cost model** | On-demand pricing 對 bursty load（Black Friday browse spike）特別 friendly，唔使 over-provision |
+
+**反 case**：Order 點解唔用 DynamoDB？
+- Order 涉及金額 + 跨 service 一致性 + financial audit → CP 必須
+- Order 有 cross-user query（admin 睇所有 today's order）→ 需要 secondary index / range query → MySQL 強得多
+
+→ **Polyglot persistence**：每個 service 揀啱嘅 store，唔係一刀切。Resume 寫得出「polyglot persistence」係 +1 keyword。
+
+</details>
+
+---
+
+### 3. 你公司面試時被問 "what's hardest about microservices"，你會答邊 3 點？
+
+<details>
+<summary>📝 Solution</summary>
+
+```
+1. Distributed transactions — 跨 service 冇 ACID @Transactional，要 saga + compensation
+   + idempotency。最易出 bug、最難 debug 嘅 category。
+
+2. Operational complexity — 8 個 service 各自 deploy / monitor / log。冇 distributed
+   tracing（OpenTelemetry）你根本唔知 latency / error 喺邊一段。冇 IaC + CI/CD 直接
+   靠人手 = 災難。
+
+3. Data consistency model shift — 由 ACID 強一致過去 eventual consistency。前端要
+   handle "我 add cart 完之後 1 秒 refresh 仲未見到" 嘅 UX。Backend 要識用 outbox
+   pattern + idempotency key 防 retry 寫雙重。
+```
+
+**加分位**（如果 interviewer 想再深）：
+- 引用 Peter Deutsch 8 fallacies 之一（network is reliable / latency is zero）
+- 提 distributed monolith 嘅 anti-pattern（拆形不拆責任）
+
+</details>
+
+---
+
+### 4. 「shared domain model」反 pattern 你而家 monolith 有冇類似情況？
+
+<details>
+<summary>📝 Solution</summary>
+
+關鍵 insight：**單機情況下根本「冇」shared library trap，因為一切都係同一個 package** —
+sharing 就係架構本身。
+
+| | Monolith | Microservices |
+|---|----------|---------------|
+| Architecture | 1 jar, 1 deployment | N jars, N deployments |
+| Sharing User class | ✅ **就係架構** — 改完一齊 redeploy 1 個 app | ❌ **trap** — 改完要 redeploy N 個 service = lose 拆 microservices 嘅意義 |
+| Bounded context | 隱式 / 可被違反但 compiler 唔阻止 | 顯式（physical boundary）|
+
+**Mental model**：
+- Monolith：sharing 係**默認假設** — 你寫 `import com.shop.User` 唔需要諗
+- Microservices：sharing 係**特權** — 每次跨 service share 都要問「呢個係 schema (✅) 定 implementation (❌)？」
+
+**監察 monolith 入面有冇即將會變成 trap 嘅嘢**：
+- `BaseService` / `BaseEntity` / `BaseRepository` — 喺 monolith OK，**永遠唔可以**搬入 cross-service shared module
+- 你拆 service 時，每個 service 自己 copy 一份（DRY 嘅例外 — bounded context > DRY）
+
+**呢個解釋咗 L2 嘅 deliverable design**：
+- `common-events` ✅ — schema (event POJO contract)
+- `common-dto` ✅ — schema (response envelope structure)
+- 永遠**唔起** `common-domain` 入面放 `User` `Order` `Product` entity — 即係搬 monolith 嘅 sharing 假設過嚟微服務世界，係 distributed monolith 嘅起點
+
+</details>
 
 ---
 
