@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                               https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <!-- ====== Section 1: POM model version (boilerplate, 無得改) ====== -->
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ====== Section 2: 我哋自己 project 嘅 coordinates ====== -->
+    <groupId>com.onlineshopping</groupId>             <!-- 通常 reverse-domain；同 monolith 一致？ -->
+    <artifactId>onlineshopping-microservices-parent</artifactId>       <!-- 例：onlineshopping-microservices-parent -->
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>                <!-- ⚠️ 一定係 pom，唔係 jar -->
+
+    <name>OnlineShopping Microservices Parent</name>
+    <description>Parent POM for the OnlineShopping microservices course</description>
+
+    <!-- ====== Section 3: properties (跨 module 共享變數) ====== -->
+    <properties>
+        <java.version>21</java.version>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spring-boot.version>3.5.14</spring-boot.version>   <!-- 你揀 patch -->
+    </properties>
+
+    <!-- ====== Section 4: modules (aggregation — root build 帶起邊幾個 child) ====== -->
+    <modules>
+        <module>shared/common-events</module>
+        <module>shared/common-dto</module>
+        <module>services/user-service</module>
+    </modules>
+
+    <!-- ====== Section 5: dependencyManagement (inheritance + BOM import) ====== -->
+    <dependencyManagement>
+        <dependencies>
+            <!-- 5.1 Spring Boot BOM — 200+ curated versions 由呢度入 -->
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- 5.2 我哋自己 shared modules — 等 service module 引用唔使每次寫 version -->
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>common-events</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>common-dto</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- ====== Section 6: build / pluginManagement ====== -->
+    <build>
+        <pluginManagement>
+            <plugins>
+                <!-- 6.1 spring-boot-maven-plugin: 只有 service module 用嚟打 fat jar；
+                         shared module 唔用。所以放 pluginManagement，child opt-in -->
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <version>${spring-boot.version}</version>
+                </plugin>
+
+                <!-- 6.2 maven-compiler-plugin: 全 child 都用 -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.15.0</version>
+                    <configuration>
+                        <source>${java.version}</source>
+                        <target>${java.version}</target>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.5.5</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-jar-plugin</artifactId>
+                    <version>3.5.0</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>
