@@ -451,12 +451,151 @@ curl http://localhost:8080/health
 
 ## 12. Homework / Reflection
 
-完 lesson 之前自問：
+> 自己諗完先 expand 答案。
 
-1. 如果有人 PR 一個叫 `common-domain` 嘅新 module 入嚟，入面有 `User.java` `@Entity`，你點 review？拒絕嘅理由有哪 3 條？
-2. 點解我哋 root pom 嘅 `<dependencyManagement>` 入面要 declare `common-events` 同 `common-dto`？如果唔 declare，service module 自己加 dependency 會點？
-3. 你 monolith 個 single-module pom 有冇 `<pluginManagement>`？如果冇，係靠 `spring-boot-starter-parent` 默認 pin？
-4. 如果而家換項目 `<spring-boot.version>3.5.14 → 3.6.0</spring-boot.version>`，所有 service 要唔要改自己 pom？點解？
+### 1. 如果有人 PR 一個叫 `common-domain` 嘅新 module 入嚟，入面有 `User.java` `@Entity`，你點 review？拒絕嘅理由有哪 3 條？
+
+<details>
+<summary>📝 Solution</summary>
+
+拒絕呢個 PR 唔係因為 code style，係因為佢同時 violate **三個獨立原則**，每條都係 microservices 嘅核心 commitment：
+
+| # | 角度 | 災難 |
+|---|------|------|
+| 1 | **Database coupling** | `@Entity` 暗示 ORM 對應一張 table。所有 import 呢個 module 嘅 service 隱含 share 同一張 user table → DB-per-service 原則直接破。 |
+| 2 | **Deployment coupling** | User schema 加一個 field → common-domain 出新 version → 所有 dependent service 全部要 rebuild + redeploy → 失去獨立 deployment → 變相 distributed monolith。 |
+| 3 | **Domain boundary violation (DDD)** | User 嘅 business rule（password policy / email validation / role transition）只屬 User service。共享 entity = 共享 mutation logic = 多個 service 都可以 mutate 同一個 user state → bounded context 邊界破。 |
+
+**Bonus 第 4 條**：testing coupling — common-domain 改一個 method signature → 所有 downstream service test 跟住 break。
+
+**邊啲嘢可以放 shared module？**
+- ✅ `common-events`：immutable event payload (DTO with no behaviour, no `@Entity`)
+- ✅ `common-dto`：API request/response DTO (cross-service contract)
+- ❌ Entity / Repository / Service / business logic — **絕對唔可以**
+
+**面試 punch line**：「拒絕呢個 PR 唔係 code style 問題，係佢同時 violate database coupling、deployment coupling 同 domain boundary 三個獨立原則 — 每條都係 microservices 嘅 first principle。共享 DTO 可以，共享 entity 等於用微服務嘅 packaging 寫返一個 monolith。」
+
+</details>
+
+---
+
+### 2. 點解我哋 root pom 嘅 `<dependencyManagement>` 入面要 declare `common-events` 同 `common-dto`？如果唔 declare，service module 自己加 dependency 會點？
+
+<details>
+<summary>📝 Solution</summary>
+
+**Declare 喺 parent 嘅作用：single source of truth for version。**
+
+Parent declare 之後：
+```xml
+<!-- service pom：只寫 groupId + artifactId，唔寫 version -->
+<dependency>
+    <groupId>com.onlineshopping</groupId>
+    <artifactId>common-events</artifactId>
+</dependency>
+```
+
+唔 declare 嘅後果：
+```xml
+<!-- 每個 service 都要自己寫 version -->
+<dependency>
+    <groupId>com.onlineshopping</groupId>
+    <artifactId>common-events</artifactId>
+    <version>1.0.0-SNAPSHOT</version>  <!-- 7 個 service 都要寫 -->
+</dependency>
+```
+
+**會出咩問題：**
+
+1. **Version drift** — `user-service` 寫 `1.0.0`，`order-service` 寫 `1.1.0`，runtime classpath 唔知用邊個（depends on Maven 解析次序），出 weird `NoSuchMethodError`。
+2. **Bump 成本爆炸** — common-events 出 `1.2.0` → 7 個 service pom 都要逐個改。Parent declare 嘅話改一行 property 就掂。
+3. **Audit / SBOM 唔 consistent** — security scan / dependency report 出多個 version，難 trace。
+
+**面試 punch line**：「`<dependencyManagement>` 等於 vending machine：parent 印 menu（version），child opt-in（用 `<dependencies>` 唔寫 version）。Single source of truth 唔止係 best practice，係 multi-module project 嘅 minimum bar。」
+
+</details>
+
+---
+
+### 3. 你 monolith 個 single-module pom 有冇 `<pluginManagement>`？如果冇，係靠 `spring-boot-starter-parent` 默認 pin？
+
+<details>
+<summary>📝 Solution</summary>
+
+呢條問題有兩 part，要兩部分都答：
+
+**(a) Monolith 有冇 `<pluginManagement>`？**
+
+**冇**。Monolith pom inherit `spring-boot-starter-parent`，由 starter-parent 自動 pin 住所有常用 plugin：
+- `maven-compiler-plugin` (對應 `<java.version>`)
+- `maven-surefire-plugin` / `maven-failsafe-plugin` (test runner)
+- `spring-boot-maven-plugin` (`bootRun`, `bootJar`)
+- `maven-jar-plugin`、`maven-resources-plugin` 等
+
+**(b) 點解 microservices 呢個 project 反而要自己寫 `<pluginManagement>`？**
+
+因為我哋揀咗 **BOM import (Way 2)** 而唔係 `spring-boot-starter-parent` (Way 1)：
+
+| 揀法 | Plugin pinning |
+|------|----------------|
+| **Way 1**: `<parent>spring-boot-starter-parent</parent>` | 自動 pin (free) |
+| **Way 2**: `<dependencyManagement>` BOM import | 自己手動 pin（fixed cost） |
+
+點解仲要揀 Way 2？因為 multi-module 入面 `<parent>` 個 slot 我哋要留俾自己嘅 aggregator POM (`onlineshopping-microservices-parent`)，唔可以同時又 inherit `spring-boot-starter-parent`。
+
+**結論**：BOM import 唔 free — 換到 version curation 嘅同時要付 plugin pinning 嘅 fixed cost。我哋 root pom 嘅 `<pluginManagement>` 就係呢個 cost。
+
+**面試 punch line**：「Monolith 用 starter-parent，plugin 自動搞掂。Multi-module microservices 通常用 BOM import 因為 `<parent>` slot 要俾自己 aggregator，所以要自己寫 `<pluginManagement>` 補返呢個 fixed cost — trade-off 但值得。」
+
+</details>
+
+---
+
+### 4. 如果而家換項目 `<spring-boot.version>3.5.14 → 3.6.0</spring-boot.version>`，所有 service 要唔要改自己 pom？點解？
+
+<details>
+<summary>📝 Solution</summary>
+
+**唔需要改 service pom。** 改 parent 一行 property 就完。
+
+點解 work？睇 chain：
+
+```
+parent pom.xml
+├─ <properties>
+│    <spring-boot.version>3.5.14</spring-boot.version>   ← 改呢度
+│
+└─ <dependencyManagement>
+     <dependency>
+       <groupId>org.springframework.boot</groupId>
+       <artifactId>spring-boot-dependencies</artifactId>
+       <version>${spring-boot.version}</version>          ← 跟住 resolve
+       <type>pom</type>
+       <scope>import</scope>
+     </dependency>
+   </dependencyManagement>
+
+service pom.xml (e.g. user-service)
+└─ <dependencies>
+     <dependency>
+       <groupId>org.springframework.boot</groupId>
+       <artifactId>spring-boot-starter-web</artifactId>   ← 唔寫 version
+     </dependency>                                         ← 跟 parent BOM 攞
+```
+
+Bump `3.5.14 → 3.6.0`：
+1. Parent property 改一個字
+2. BOM import resolve 出 `spring-boot-dependencies:3.6.0`
+3. Service 入面所有 `spring-boot-starter-*` / Jackson / Hibernate / Tomcat 等 transitive dep 自動跟住升
+4. **Service pom 一個字都唔使改**
+
+**注意 caveat**：唔代表唔會炒
+- 大版本升（e.g. `3.x → 4.x`）可能有 breaking API change → service code 要改（但 pom 仲係唔使改）
+- Patch / minor 版升通常 transparent
+
+**面試 punch line**：「BOM import + parent property 嘅最大 payoff 就喺呢度 — 一個字 bump 全 fleet 跟住升。如果每個 service 都自己寫 spring-boot version，呢個動作要改 7 個 pom + 7 個 review + 7 個 risk window，係 distributed monolith 嘅 maintenance cost 嘅典型表現。」
+
+</details>
 
 ---
 
