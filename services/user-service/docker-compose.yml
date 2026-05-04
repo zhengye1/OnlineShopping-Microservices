@@ -1,0 +1,60 @@
+# Local development infrastructure for user-service.
+#
+# Usage:
+#   docker compose up -d                # start MySQL + Adminer in background
+#   docker compose logs -f mysql        # tail MySQL logs
+#   docker compose ps                   # show running containers + health
+#   docker compose down                 # stop containers (data persists in named volume)
+#   docker compose down -v              # stop + DELETE data volume (fresh state)
+#
+# Adminer DB browser:    http://localhost:8090
+#   Server: mysql
+#   Username/Password:   user_service / user_service_pw
+#   Database:            user_service
+#
+# Connect from app code: jdbc:mysql://localhost:3307/user_service
+#
+# Credentials are env-overridable; defaults are dev-only — DO NOT use in production.
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: user-service-mysql
+    restart: unless-stopped
+    ports:
+      - "3307:3306"                                 # host 3307 → container 3306 (避免 clash with system MySQL)
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_DATABASE:      ${MYSQL_DATABASE:-user_service}
+      MYSQL_USER:          ${MYSQL_USER:-user_service}
+      MYSQL_PASSWORD:      ${MYSQL_PASSWORD:-user_service_pw}
+      TZ: UTC
+    volumes:
+      - user_service_mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+00:00
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  adminer:
+    image: adminer:5
+    container_name: user-service-adminer
+    restart: unless-stopped
+    ports:
+      - "8090:8080"                                 # http://localhost:8090
+    environment:
+      ADMINER_DEFAULT_SERVER: mysql
+      ADMINER_DESIGN: dracula
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  user_service_mysql_data:
+    name: user_service_mysql_data                   # explicit name, avoid project-prefix
