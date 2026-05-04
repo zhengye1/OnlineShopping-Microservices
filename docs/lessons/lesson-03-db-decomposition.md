@@ -735,13 +735,235 @@ Total: ~10 weeks for one entity migration
 
 ## 9. Homework / Reflection
 
-完 lesson 之前自問（解答下節 L4 開始時 fold 入 collapsible block）：
+> 自己諗完先 expand 答案。
 
-1. 你 monolith 嘅 `Order` 表入面有冇 `Decimal totalAmount` column？如果有，呢個值點計？係 `SUM(orderItem.priceAtOrderTime * qty)` 還是儲存值？兩種做法各有咩 trade-off？
-2. 假設一個 product 改名（e.g. `iPhone 15` → `iPhone 15 (refurb)`），如果 cart-service 唔 snapshot product name 而係每次 GetCart 即 call product-service 攞 fresh — 用戶將件嘢加入 cart 之後，唔小心 refresh 一吓，發現名變咗，會困惑唔會？應該點處理 UX？
-3. Outbox table 應該 partition / index 喺邊個 column？Background poller 嘅 query (`SELECT WHERE published=false ORDER BY id LIMIT 100`) 點先 efficient？
-4. 如果 monolith 嘅 `user` 表有 `password_hash` column，搬上 microservices 嘅 `user-service` 係咪一定要重新 hash？定可以 raw migration？背後有冇 security 考量？
-5. Phase 2 shadow-read 期間，drift detection 用咩 criteria 比 raw `equals()` 更好？(hint: 諗下 `updatedAt` 會 drift 但唔代表有問題)
+### 1. 你 monolith 嘅 `Order` 表入面有冇 `Decimal totalAmount` column？如果有，呢個值點計？係 `SUM(orderItem.priceAtOrderTime * qty)` 還是儲存值？兩種做法各有咩 trade-off？
+
+<details>
+<summary>📝 Solution</summary>
+
+**第一原則：錢銀絕對唔用 `Double` / `Float`。** 用 `BigDecimal` (Java) 或者 `long` (cents) — 後者更 production-grade，避免任何 float 精度 drift（典型 trap：`0.1 + 0.2 = 0.30000000000000004`）。
+
+**Stored vs Computed total — trade-off：**
+
+| | Stored `total_amount` | Computed `SUM(price × qty)` |
+|--|--|--|
+| 👍 Pro | O(1) read，order list query 快；historical truth frozen | 永遠同 line items consistent |
+| 👎 Con | 可能 drift（buggy update / mis-aligned schema migration）| 每次 read aggregate；無法 reflect 歷史性嘅 schema change |
+
+**Production 答案：兩個一齊做** — store `total_amount` 做 canonical truth，喺 write path 用 assertion 確保 `total_amount == expected total`。
+
+**⚠️ 但 `total_amount` 唔一定等於 `SUM(items)`** — Order 通常仲有：
+
+```
+total_amount = SUM(item.price_at_order_time × item.qty)
+             + tax
+             + shipping_fee
+             - discount
+             - coupon_amount
+```
+
+每個 component 都應該係 separate column 喺 `order` 表 → audit trail intact。將來 finance / accounting query 可以 reconstruct 當時所有計算。
+
+**面試 punch line**：「Store total 唔係冗餘，係 audit-trail 必需 — line item schema 將來 evolve（加 discount column / tax column），舊 order 嘅 historical total 必須 freeze。Sum-of-items 係 sanity check，唔係 source of truth。Money type 用 `long` cents 避免 float 精度 trap。」
+
+</details>
+
+---
+
+### 2. 假設一個 product 改名（e.g. `iPhone 15` → `iPhone 15 (refurb)`），如果 cart-service 唔 snapshot product name 而係每次 GetCart 即 call product-service 攞 fresh — 用戶將件嘢加入 cart 之後，唔小心 refresh 一吓，發現名變咗，會困惑唔會？應該點處理 UX？
+
+<details>
+<summary>📝 Solution</summary>
+
+**Yes，用戶一定 confused。但 snapshot 唔係正解。**
+
+設計原則：
+- **Cart = current intent**（用戶即將要買乜）→ 顯示 fresh data
+- **Order = historical fact**（用戶當時買咗乜）→ snapshot freeze
+
+兩者 lifecycle 唔同，處理唔同。Cart 應該係 **store `productId` + 偵測 change → warn user**：
+
+```javascript
+// GetCart pseudo-code
+GET /cart:
+  cartItems = dynamoQuery(USER#123)
+  productIds = cartItems.map(i => i.productId)
+  liveProducts = productSvc.getProducts(productIds)   // fresh API call
+
+  return cartItems.map(item => {
+    const live = liveProducts[item.productId]
+    return {
+      productId,
+      currentName:  live.name,         // 顯示 fresh
+      currentPrice: live.price,
+      currentImage: live.image,
+      qty: item.qty,
+      // ⚠️ Detection logic:
+      warnings: [
+        live.name  !== item.nameAtAdd          && "name_changed",
+        live.price !== item.priceAtAdd          && "price_changed",
+        live.deleted                            && "discontinued",
+      ].filter(Boolean)
+    }
+  })
+```
+
+**UI 應該顯示**：
+- ✅ 用 **CURRENT** name/price/image — 用戶見到佢即將要買嘅嘢嘅實況
+- ⚠️ 但 **flag 任何 material change** with diff vs `priceAtAdd` / `nameAtAdd` snapshots：
+  - `"⚠️ Price changed from $999 → $1099 since you added — [Update] / [Remove]"`
+  - `"⚠️ Product details have been updated — [Review]"`
+  - `"❌ No longer available — [Remove]"`
+
+**面試 punch line**：「Cart 嘅 product info 唔係 snapshot，係 detect-change pattern。Snapshot `priceAtAdd` 同 `nameAtAdd` 唔係用嚟 freeze，係用嚟做 diff source — 顯示 current 但提醒 changed。Cart 反映 current intent，Order 反映 historical fact，兩者 freeze policy 唔同。」
+
+</details>
+
+---
+
+### 3. Outbox table 應該 partition / index 喺邊個 column？Background poller 嘅 query (`SELECT WHERE published=false ORDER BY id LIMIT 100`) 點先 efficient？
+
+<details>
+<summary>📝 Solution</summary>
+
+Background poller query：
+```sql
+SELECT * FROM outbox
+WHERE published = false
+ORDER BY id
+LIMIT 100;
+```
+
+**Index 揀法（由細至大改善）：**
+
+| Index | 評 |
+|-------|-----|
+| `INDEX (published)` | 簡單，但已 published 嘅 row 仍佔 index 空間 |
+| `INDEX (published, id)` ⭐ | 直接 hit composite index，`ORDER BY id` 唔需 sort |
+| `INDEX ... WHERE published = false` (partial / filtered index) | Postgres 支援，only index unpublished rows — index 永遠細 |
+
+**仲要做嘅嘢：**
+- 已 published 嘅 row：cron job 過 7 日 archive / delete（避免 outbox 表無限大）
+- ID 用 auto-increment `BIGINT`（FIFO order，配合 index 自然 ascending）
+- **唔好用 random UUID** 做 PK — random insert 破壞 B-tree locality，high write throughput 下 page split 嚴重，性能跌
+- 如果一定要 UUID，用 UUIDv7（time-ordered，B-tree friendly）
+
+**Throughput 細節**：
+- Poller 每秒一次 → 每秒處理 100 events → **唔同 batch 太大**：commit transaction 太貴，亦影響 publish latency
+- 可以多個 poller instance 跑，用 `SELECT ... FOR UPDATE SKIP LOCKED`（PostgreSQL）做 row-level lock，保證唔重複 publish
+
+**面試 punch line**：「Outbox table 嘅 hot path 係 unpublished poller query。Composite index `(published, id)` 或者 partial index `WHERE published=false` 直接 serve query，published row 自然 fall out of index。配合 cron archive + auto-increment PK + `SKIP LOCKED` for parallel poller，可以 sustain 萬級 TPS event publishing。」
+
+</details>
+
+---
+
+### 4. 如果 monolith 嘅 `user` 表有 `password_hash` column，搬上 microservices 嘅 `user-service` 係咪一定要重新 hash？定可以 raw migration？背後有冇 security 考量？
+
+<details>
+<summary>📝 Solution</summary>
+
+**Algorithm 一致 → 直接 raw migration safe**。Same hash function (e.g. bcrypt) + same cost factor (e.g. 12) + same salt strategy → hash 本身就係 self-contained credential，搬去邊都 work。
+
+**但有 3 種情況 hash 要 upgrade：**
+
+| 情境 | 解法 |
+|------|------|
+| Algorithm 升級（e.g. SHA-1 → bcrypt） | **必須** rehash |
+| Cost factor 升（e.g. bcrypt cost 10 → 12） | **應該** rehash |
+| Encoding / serialization 改變 | 視乎相容性 |
+
+**Production 標準：Lazy Upgrade（hash on next login）**
+
+唔好 force user 重新輸入 password — 係 UX 災難（dormant user 流失，看似 security incident）。正解：
+
+```java
+public boolean login(String email, String rawPassword) {
+    User user = userRepo.findByEmail(email);
+
+    // Step 1: verify with stored hash (works for both old + new algo)
+    if (!passwordEncoder.matches(rawPassword, user.getPasswordHash())) {
+        return false;
+    }
+
+    // Step 2: if hash uses old algo, transparently upgrade
+    if (passwordEncoder.upgradeEncoding(user.getPasswordHash())) {
+        // user 仲未 logout，rawPassword 在手
+        String newHash = passwordEncoder.encode(rawPassword);
+        user.setPasswordHash(newHash);
+        userRepo.save(user);
+    }
+
+    return true;
+}
+```
+
+Spring Security `DelegatingPasswordEncoder` 直接 build-in 呢個 pattern — `{bcrypt}xxxx` 同 `{argon2}yyyy` 用 prefix 區分 algorithm，可以同時存兩種，新登入嘅自動 upgrade。
+
+**好處**：
+- 用戶完全唔知道發生過 migration
+- 活躍用戶 1-2 個月內全部 upgrade
+- Dormant account 唔需 force（佢哋本身就唔 login）
+
+**其他 security 考量：**
+- `password_hash` **絕對唔好** appear 喺任何 API response (JSON serialization) → use `@JsonIgnore` / DTO whitelist
+- DB encryption at rest **唔代替** hashing — hashing 防 DBA / DB breach；encryption-at-rest 防物理偷 disk
+- 如果 monolith 用咗 weak algorithm（MD5 / SHA-1 / unsalted），搬之前 force reset 反而正確
+
+**面試 punch line**：「Password migration 嘅 textbook 答法係 **lazy rehash on login**：直接搬 hash + 喺 login flow check 算法 version + transparently upgrade。用戶 0 friction，security 跟最新 algo。Force re-entry 係 anti-pattern — 反而 train 用戶將「突然要重新 login」normalize，將來真 phishing 個個跌。」
+
+</details>
+
+---
+
+### 5. Phase 2 shadow-read 期間，drift detection 用咩 criteria 比 raw `equals()` 更好？(hint: 諗下 `updatedAt` 會 drift 但唔代表有問題)
+
+<details>
+<summary>📝 Solution</summary>
+
+**Trap**：raw `equals()` 永遠 fail，drift dashboard 全紅，但其實係 false positive。
+
+點解？
+
+> Monolith 寫個 user 入自己 DB → MySQL 寫 `updated_at = NOW() = 14:32:00.123`
+> Outbox publisher 過 0.5 秒 publish event → user-service consume → 寫入新 DB → MySQL 寫 `updated_at = NOW() = 14:32:00.638`
+>
+> **Same data，different `updated_at`**。Naive `equals()` 認為 drift。
+
+**正解：compare business fields，ignore auto-generated metadata。**
+
+| 比較策略 | Field | 點解 |
+|---------|-------|------|
+| ✅ Compare | email, role, address, name, status, password_hash | Business meaning |
+| ❌ Ignore | `updated_at`, `created_at` | Different write timestamps，必然 drift |
+| ❌ Ignore | `version` (optimistic lock) | Per-DB sequence，無 cross-system meaning |
+| ❌ Ignore | DB-internal sequence ID（如果兩邊唔 share） | Same row 兩邊 surrogate key 唔同 |
+
+**3 種寫法（複雜度遞增）：**
+
+```java
+// 1. Whitelist business fields
+record UserComparable(String email, String role, String addressJson, String passwordHash) {}
+boolean equal = toComparable(monolithUser).equals(toComparable(newUser));
+
+// 2. Hash whitelist for efficiency (sample-based, low overhead)
+String monolithHash = sha256(monolithUser.email + "|" + monolithUser.role + "|" + ...);
+String newHash      = sha256(newUser.email + "|" + newUser.role + "|" + ...);
+boolean equal = monolithHash.equals(newHash);
+
+// 3. Field-level diff (debug 用，揾 root cause)
+List<String> drifts = new ArrayList<>();
+if (!Objects.equals(monolithUser.email, newUser.email)) drifts.add("email");
+if (!Objects.equals(monolithUser.role,  newUser.role))  drifts.add("role");
+log.warn("drift fields: {}", drifts);
+```
+
+**Whitelist > Blacklist**：將來新 metadata field 加入（e.g. `last_password_change_at`），whitelist 自動唔包，唔會 false-positive；blacklist 要記得 update。
+
+**面試 punch line**：「Shadow-read drift detection 嘅 trap 唔係 logic，係 noise — auto-generated metadata（updatedAt, version, sequence ID）一定 drift 但唔係 bug。要 explicit whitelist business fields 黎 compare，唔係 blacklist metadata（whitelist 比 blacklist safe — 將來新 metadata field 加入唔會 break drift detector）。」
+
+</details>
 
 ---
 
