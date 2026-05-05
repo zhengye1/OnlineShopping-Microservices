@@ -19,8 +19,8 @@
     <packaging>jar</packaging>
 
     <properties>
-        <jjwt.version>0.12.6</jjwt.version>
-        <testcontainers.version>1.20.4</testcontainers.version>
+        <jjwt.version>0.13.0</jjwt.version>
+        <testcontainers.version>1.21.4</testcontainers.version>
     </properties>
 
     <dependencies>
