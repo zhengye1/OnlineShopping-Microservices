@@ -36,9 +36,13 @@ spring:
     locations: classpath:db/migration
     validate-on-migrate: true
 
+
 # ===== Server =====
 server:
   port: 8081                        # monolith 用 8080；user-service 8081
+  error: # ← 新加
+    include-message: always           # ← 新加
+    include-binding-errors: always    # ← 新加
 
 # ===== Application-specific config =====
 app:
