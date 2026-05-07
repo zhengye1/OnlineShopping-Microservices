@@ -5,6 +5,7 @@ import com.onlineshopping.user.dto.LoginRequest;
 import com.onlineshopping.user.dto.RegisterRequest;
 import com.onlineshopping.user.entity.Role;
 import com.onlineshopping.user.entity.User;
+import com.onlineshopping.user.event.UserCreatedEvent;
 import com.onlineshopping.user.repository.UserRepository;
 import com.onlineshopping.user.security.JwtProperties;
 import com.onlineshopping.user.security.JwtService;
@@ -32,6 +33,7 @@ public class AuthService {
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
     private final JwtProperties jwtProps;
+    private final OutboxService outboxService;
 
     /**
      * Register a new user. Returns JWT immediately (auto-login).
@@ -51,6 +53,14 @@ public class AuthService {
                 .build();
         user = userRepo.save(user);
         log.info("Registered user id={} email={}", user.getId(), user.getEmail());
+
+        // Outbox: write event in the SAME transaction → atomic with user INSERT.
+        // OutboxService uses Propagation.MANDATORY so this would throw if no @Transactional.
+        outboxService.record(
+                UserCreatedEvent.TYPE,
+                user.getId().toString(),
+                new UserCreatedEvent(user.getId(), user.getEmail(), user.getRole(), user.getCreatedAt())
+        );
 
         return buildAuthResponse(user);
     }
