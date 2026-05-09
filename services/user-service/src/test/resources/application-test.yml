@@ -1,0 +1,20 @@
+# Test profile config — Testcontainers will inject DataSource at runtime via @ServiceConnection.
+# 呢度只放 non-DataSource overrides；DB URL / username / password 由 Testcontainers 動態 set。
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true                  # 測試時開晒 SQL log 方便 debug
+  flyway:
+    enabled: true
+
+app:
+  jwt:
+    secret: test-only-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    expiration-minutes: 5
+    issuer: user-service-test
+
+logging:
+  level:
+    com.onlineshopping: DEBUG
+    org.testcontainers: INFO

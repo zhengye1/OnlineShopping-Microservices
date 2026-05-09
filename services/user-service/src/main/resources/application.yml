@@ -1,0 +1,60 @@
+spring:
+  application:
+    name: user-service
+
+  # ===== DataSource (MySQL via local Docker — see services/user-service/docker-compose.yml) =====
+  datasource:
+    url: jdbc:mysql://localhost:3307/user_service?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: ${DB_USER:user_service}
+    password: ${DB_PASSWORD:user_service_pw}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+      max-lifetime: 1800000
+
+  # ===== JPA / Hibernate =====
+  jpa:
+    hibernate:
+      ddl-auto: validate            # Flyway 控制 schema；JPA 只 validate entity ↔ table mapping
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+        # Anti-N+1 default：fetch 一定要 explicit
+        default_batch_fetch_size: 16
+    show-sql: false                 # 開發 debug 可 toggle on
+    open-in-view: false             # ⭐ 禁用 OSIV — production grade，強迫 explicit transaction boundary
+
+  # ===== Flyway migration =====
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+
+
+# ===== Server =====
+server:
+  port: 8081                        # monolith 用 8080；user-service 8081
+  error: # ← 新加
+    include-message: always           # ← 新加
+    include-binding-errors: always    # ← 新加
+
+# ===== Application-specific config =====
+app:
+  jwt:
+    # ⚠️ Dev fallback — prod 必須 override via env var
+    secret: ${JWT_SECRET:dev-only-secret-please-override-in-production-min-256-bits-long-aaaaaaaaaaaaaaaa}
+    expiration-minutes: ${JWT_EXPIRATION_MINUTES:60}
+    issuer: user-service
+
+# ===== Logging =====
+logging:
+  level:
+    com.onlineshopping: DEBUG
+    org.springframework.security: INFO
+    org.hibernate.SQL: INFO
