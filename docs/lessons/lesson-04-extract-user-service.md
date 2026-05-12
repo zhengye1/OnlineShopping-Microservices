@@ -600,13 +600,299 @@ L4 故意冇做嘅嘢（記低，面試講得出 trade-off）：
 
 ## 11. Homework / Reflection
 
-完 lesson 之前自問（解答下節 L5 開始時 fold 入 collapsible block）：
+> 自己諗完先 expand 答案。
 
-1. `OutboxService.record()` 用 `Propagation.MANDATORY`。如果改成 `REQUIRED` 會點？寫一個刻意 bug 嘅 test case 證明 atomicity 失效。
-2. `JwtService` 用 HS256 symmetric。L7+ 抽 cart-service 嗰陣，cart-service 點 verify 用戶 token？兩個 service 點 share secret？呢個方案有咩 production risk？
-3. 你 `application-test.yml` 嘅 `app.jwt.expiration-minutes: 5`。如果 integration test 跑超過 5 分鐘，會發生咩事？點解我哋實際 OK？
-4. `Role` enum 暫時得 3 個值 (USER/ADMIN/SELLER)。如果 product team 突然要 SUPER_ADMIN 同 MODERATOR 兩個新 role，schema migration 點寫？JPA entity 點改？舊 user 嘅 `role` column 會點？
-5. Outbox poller 係 `@Scheduled(fixedDelay=1000)`。如果一個 batch publish 100 個 events 用咗 5 秒，下一個 batch 幾時跑？解釋 `fixedDelay` vs `fixedRate` 嘅分別 + 我哋揀邊個更啱 + 為何。
+### 1. `OutboxService.record()` 用 `Propagation.MANDATORY`。如果改成 `REQUIRED` 會點？寫一個刻意 bug 嘅 test case 證明 atomicity 失效。
+
+<details>
+<summary>📝 Solution</summary>
+
+**MANDATORY vs REQUIRED — 兩種 propagation 嘅根本分別：**
+
+| Propagation | 有 outer tx | 無 outer tx |
+|---|---|---|
+| `REQUIRED` | join outer tx | **silently 開新 tx** |
+| `MANDATORY` | join outer tx | **拋 `IllegalTransactionStateException`** |
+
+Outbox pattern 嘅 atomicity 全靠「entity insert + outbox insert 喺**同一個 tx**」嚟保證 — 要麼一齊 commit，要麼一齊 rollback。如果用咗 `REQUIRED`，下面呢個 careless caller 就 silently 破壞咗呢個 invariant：
+
+```java
+@Test
+void recordWithoutOuterTx_silentlyBreaksAtomicity() {
+    // 注意：caller 完全冇 @Transactional wrapping
+    outboxService.record("UserCreated", "user-123",
+        "{\"email\":\"x@y.com\"}");
+
+    // REQUIRED 版本：record() 自己開新 tx，commit 咗條 outbox row
+    // 但根本冇對應 user entity insert！
+    assertThat(outboxRepo.findAll()).hasSize(1);  // ← 鬼 event 寫入
+
+    assertThat(userRepo.findAll()).isEmpty();     // ← 但 user 不存在
+    // → consumer 收到 UserCreated 事件，去 query user → 404
+    // → 下游 state 同上游 永久 divergent
+}
+```
+
+**MANDATORY 嘅唯一 job 係 fail-fast — 喺 dev 階段就拋 exception，阻止呢類 bug 編譯通過。** Test 應該係：
+
+```java
+@Test
+void recordWithoutOuterTx_throws() {
+    assertThatThrownBy(() ->
+        outboxService.record("UserCreated", "user-123", "{}"))
+        .isInstanceOf(IllegalTransactionStateException.class)
+        .hasMessageContaining("No existing transaction found");
+}
+```
+
+**Production 答案**：Outbox pattern 嘅原子性係 contract，唔係 hopeful invariant。MANDATORY 將 contract 由「signature 描述」升級為「runtime 強制」，等於 design-by-contract 喺 Spring 嘅落地。
+
+</details>
+
+---
+
+### 2. `JwtService` 用 HS256 symmetric。L7+ 抽 cart-service 嗰陣，cart-service 點 verify 用戶 token？兩個 service 點 share secret？呢個方案有咩 production risk？
+
+<details>
+<summary>📝 Solution</summary>
+
+呢題核心係 **symmetric vs asymmetric signature** 嘅 trade-off。
+
+### 路 A — Shared HS256 secret（L4 quick win）
+
+```yaml
+# user-service application.yml + cart-service application.yml
+app:
+  jwt:
+    secret: ${JWT_SECRET}   # 兩個 service 共用同一個 env var
+```
+
+- Cart-service `@Value("${app.jwt.secret}")` 攞 secret，自己 verify signature → stateless，零 network call
+- **致命 production risk**：HS256 係 **symmetric** key — secret 同時係 sign key 同 verify key。任何一個持 secret 嘅 service 都可以**偽造**任意 user 嘅 token。一個 service compromise = 全 fleet auth 失守。Blast radius 隨 service 數量線性放大。
+
+### 路 B — Asymmetric (RS256 / ES256) ← industry standard
+
+```
+auth-service:
+  - 持 private key (ONLY here)
+  - 簽 token (sign with private key)
+  - 暴露 JWKS endpoint: GET /.well-known/jwks.json → public key
+
+cart-service / product-service / ...:
+  - 啟動時 fetch JWKS，cache public key (+ TTL)
+  - 用 public key 只可 verify，無法 forge
+```
+
+| 屬性 | HS256 | RS256 |
+|---|---|---|
+| Verify 速度 | 快（HMAC）| 慢 ~10x（RSA verify）|
+| Sign 速度 | 快 | 慢 |
+| Compromise blast radius | 全 fleet | 只係 auth-service |
+| Key rotation | 手動 sync 全部 service | JWKS endpoint 自動 propagate |
+| Operationally | 簡單但脆弱 | 複雜但 contained |
+
+### 路 C — Token introspection（每 request 集中驗證）
+
+```
+cart-service 每收到 token →
+  POST auth-service:/oauth2/introspect {token}
+  → {active: true, sub: "user-123", scope: [...]}
+```
+
+- Pro：即時 revocation（黑名單可即時生效）
+- Con：每 request 多一個 network hop + auth-service 變單點故障 + auth-service load 隨 fleet QPS 線性放大
+
+### Production 嘅實際做法
+
+**大廠 default = 路 B (RS256 + JWKS) + short TTL (5-15 min) + denylist (Redis)**：
+- Sign/verify 全 stateless → 唔需要 hot path 打 auth-service
+- Public key 唔 sensitive → 散得到處都係都唔危險
+- Short TTL 控制 revocation lag
+- Denylist 處理 emergency revocation（logout、stolen token）
+
+**L7 cart-service migration plan**: 當時會 refactor `JwtService` 由 HS256 → RS256，引入 `JwtKeyProvider` 抽象。L4 嘅 HS256 係故意嘅 simplification — single-service-stage 嘅 secret distribution problem 仲未浮面。
+
+</details>
+
+---
+
+### 3. 你 `application-test.yml` 嘅 `app.jwt.expiration-minutes: 5`。如果 integration test 跑超過 5 分鐘，會發生咩事？點解我哋實際 OK？
+
+<details>
+<summary>📝 Solution</summary>
+
+**呢題嘅 trap 係：token expiration 嘅 semantic 係 token-side，唔係 test-side。**
+
+### Timeline 拆解
+
+| 時刻 | 發生 |
+|---|---|
+| T = 0.000s | `register()` → JWT 簽出，`exp` claim = `now + 300s` = T + 300 |
+| T = 0.150s | Test 攞個 token 整 `Authorization: Bearer ...` |
+| T = 0.200s | MockMvc perform → `JwtAuthenticationFilter` parse token → check `exp(300) > now(0.2)` → ✅ pass |
+| T = 2.5s | Test 結束、整個 JVM exit |
+
+**Token TTL 係由 token 簽出時間起計，唔係 test suite 啟動時間。** Integration test 一條典型 run 200ms - 3s，落 5 分鐘 TTL 嘅 buffer **大過實際需要 100 倍**。
+
+### 真係 5 min 內 expire 嘅唯一可能
+
+```java
+@Test
+void verySlowTest_tokenExpires() throws InterruptedException {
+    String token = login();
+    Thread.sleep(310_000);   // 故意 sleep 過 TTL
+    mockMvc.perform(get("/users/me").header(AUTHORIZATION, "Bearer " + token))
+        .andExpect(status().isUnauthorized());   // ← 真係會 401
+}
+```
+
+Filter 解 token 時拋 `ExpiredJwtException` → custom `AuthenticationEntryPoint` 返 401。
+
+### 為何 production 都用短 TTL
+
+- 5-15 min access token TTL 係 industry standard
+- 一個 user 嘅 normal API request 跑幾百 ms — 5 min 嘅 token 有大量 buffer
+- **Refresh token** (long-lived, e.g. 30 day) 唔係用嚟拎 resource，係用嚟**換新 access token**。Resource server 永遠唔接受 refresh token。
+
+**Insight**: 「expiration-minutes 揀 5 唔係 1」係**為咗 dev experience 嘅 buffer**，唔係 test budget。若 test 真係要跑超 5 分鐘，問題喺 test design（cross-process timing? blocked external dep?）唔喺 TTL config。
+
+</details>
+
+---
+
+### 4. `Role` enum 暫時得 3 個值 (USER/ADMIN/SELLER)。如果 product team 突然要 SUPER_ADMIN 同 MODERATOR 兩個新 role，schema migration 點寫？JPA entity 點改？舊 user 嘅 `role` column 會點？
+
+<details>
+<summary>📝 Solution</summary>
+
+**Punchline 提早講：呢個 migration 容易，唯一前提係當初揀啱咗 `@Enumerated(EnumType.STRING)`。**
+
+### Migration steps（用 STRING 嘅 happy path）
+
+**Schema 層**：可以**完全唔郁**。
+- `role VARCHAR(32)` 已經容納任何 ≤32 字符嘅 string
+- 唔需要 V3 migration
+
+但**推薦加 CHECK constraint** 防 typo：
+```sql
+-- V3__add_role_check_constraint.sql
+ALTER TABLE users
+  ADD CONSTRAINT chk_users_role
+  CHECK (role IN ('USER','ADMIN','SELLER','MODERATOR','SUPER_ADMIN'));
+```
+Trade-off：每次加新 role 都要 V_x migration drop + recreate constraint。Spring 圈通常**唔加**，靠 JPA `@Enumerated(STRING)` 喺 application layer 限制 valid values。
+
+**JPA entity 層**：只改 Java enum，position 無關。
+```java
+public enum Role {
+    USER, ADMIN, SELLER, MODERATOR, SUPER_ADMIN
+    //                  ^^^^^^^^^^^^^^^^^^^^^^^^ 新加
+}
+```
+
+**舊 user 嘅 `role` column**：完全唔影響。佢哋仲存住 `'USER'` / `'ADMIN'` / `'SELLER'`，下次 query 出嚟 Hibernate 一樣識 deserialize 返對應 enum value。
+
+**數據側升級**：人手 promote 個別 user（admin tool / SQL）：
+```sql
+UPDATE users SET role = 'MODERATOR' WHERE id IN (101, 102, 103);
+UPDATE users SET role = 'SUPER_ADMIN' WHERE id = 1;
+```
+
+### 如果當初用咗 `@Enumerated(EnumType.ORDINAL)` — 地獄 mode
+
+`ORDINAL` 將 enum 儲做 **integer index**（USER=0, ADMIN=1, SELLER=2）。新加 enum value 嘅災難取決於**加邊個位置**：
+
+```java
+// 舊：USER=0, ADMIN=1, SELLER=2
+public enum Role { USER, ADMIN, SELLER }
+
+// 新（手快加喺中間）：USER=0, ADMIN=1, MODERATOR=2, SELLER=3
+public enum Role { USER, ADMIN, MODERATOR, SELLER }
+```
+
+**Silent corruption**:
+- DB 入面所有 `role = 2` 嘅 row 本來係 SELLER
+- 部署完 Java code 一 deploy 上 prod，**全部「SELLER」一夜之間變咗「MODERATOR」**
+- 無 exception、無 log、無警報
+- 用 seller 權限做嘢嘅人突然有 moderator 權限（或者相反）
+- 幾日後客戶投訴先發現
+
+**呢個係全 course 反覆強調嘅 trap**，亦係點解每次見到 JPA entity 嘅 `@Enumerated` field 都要 explicit `(EnumType.STRING)` — 唔好靠 default。Default 係 `ORDINAL` — 等如埋一個 time bomb 喺 schema 度。
+
+### 面試 punch line
+
+> 「Production schema 永遠唔好靠 enum ordinal — Hibernate default 係 ORDINAL，靜悄悄寫 int index 入 DB。加 enum value 喺中間 → row interpretation 一夜 flip，silent corruption。`@Enumerated(EnumType.STRING)` 一個 annotation 就 prevent 一整類 incident。」
+
+</details>
+
+---
+
+### 5. Outbox poller 係 `@Scheduled(fixedDelay=1000)`。如果一個 batch publish 100 個 events 用咗 5 秒，下一個 batch 幾時跑？解釋 `fixedDelay` vs `fixedRate` 嘅分別 + 我哋揀邊個更啱 + 為何。
+
+<details>
+<summary>📝 Solution</summary>
+
+**直接答 timing question**：上一個 batch 跑完 (T = 5s)，等 `fixedDelay = 1000ms` (1s)，**下一個 batch 喺 T = 6s 開始**。
+
+### `fixedDelay` vs `fixedRate` 嘅 mental model
+
+**`fixedDelay = 1000`** → 兩次 run 之間嘅 **gap** 係 1s
+
+```
+|--run1 (5s)--|<1s gap>|--run2 (5s)--|<1s gap>|--run3
+T=0          T=5      T=6           T=11     T=12
+```
+- Gap 由「上次 **end**」起計
+- 永遠唔會 overlap（單線程 scheduler）
+- 慢 batch 自動 self-throttle
+
+**`fixedRate = 1000`** → 兩次 run 嘅 **start interval** 係 1s
+
+```
+理想：    |start1|--1s--|start2|--1s--|start3|
+T=0              T=1            T=2
+
+實際 (single thread)：
+         |--run1 (5s)--||--run2 (~immediate)--|--run3
+         T=0           T=5
+                       ↑ run2 被 queue 到 run1 完先 fire
+                         之後 fire-as-fast-as-possible 直到 catch up
+```
+- Gap 由「上次 **start**」起計
+- Single-thread scheduler：慢 run 令後續所有 run pile up，catch-up 期間連續 fire
+- Multi-thread scheduler：**真係 overlap** — 兩個 thread 同時撈 outbox pending rows → double-publish 嘅 race condition
+
+### 為何 outbox poller 必須揀 `fixedDelay`
+
+| 因素 | fixedDelay 行為 |
+|---|---|
+| **DB 慢** | 慢 batch → 自動 slow polling → 唔加劇 DB 壓力 |
+| **並發控制** | 唔會兩個 poller instance race 同一批 pending rows |
+| **At-most-once dispatch** | 配合 `UPDATE outbox SET published_at = ? WHERE id = ?` 標記就足夠 |
+| **Latency 上限** | Pending row 最壞情況等 `batch_duration + 1s` |
+| **L8+ multi-instance** | 之後 horizontal scale 配 `FOR UPDATE SKIP LOCKED` 防 cross-instance race |
+
+### `fixedRate` 適合咩 use case
+
+- 每 run 必然 **sub-second** 嘅 idempotent task
+- 例：heartbeat ping、metric tick、internal health probe
+- 即係用 wall-clock 節奏壓倒 throughput 嘅 case
+
+### 第三選擇 — `cron` expression
+
+`@Scheduled(cron = "0 */5 * * * *")` → 每 5 分鐘嘅 0 秒 fire。
+- 啱晚間 batch、scheduled report、periodic cleanup
+- 唔啱 outbox（latency 太高）
+
+### Production extra：為何成熟 outbox 用 message broker 而非 poller
+
+落地一段時間之後通常會 **Debezium / Maxwell-style CDC** 替代 poller：
+- 直接讀 MySQL binlog (`row-based replication events`)
+- 唔需要 outbox table 嘅 `published_at` column
+- Sub-second latency，無 polling overhead
+- 但 setup 重 — L4 階段 poller pattern 簡單夠用，係 incremental complexity 嘅正確選擇
+
+</details>
 
 ---
 
