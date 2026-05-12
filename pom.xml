@@ -30,6 +30,7 @@
         <module>shared/common-events</module>
         <module>shared/common-dto</module>
         <module>services/user-service</module>
+        <module>services/product-service</module>
     </modules>
 
     <!-- ====== Section 5: dependencyManagement (inheritance + BOM import) ====== -->
