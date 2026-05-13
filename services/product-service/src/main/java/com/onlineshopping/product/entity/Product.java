@@ -59,12 +59,7 @@ public class Product {
     @Column(nullable = false)
     private Long version;
 
-    @OneToMany(
-            mappedBy = "product",
-            cascade = CascadeType.ALL,
-            orphanRemoval = true,
-            fetch = FetchType.LAZY
-    )
+    @OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
     private List<ProductImage> images = new ArrayList<>();
 
     @PrePersist
@@ -99,12 +94,15 @@ public class Product {
     }
 
     // equals/hashCode by id (entity identity)
-    @Override public boolean equals(Object o) {
+    @Override
+    public boolean equals(Object o) {
         if (this == o) return true;
         if (!(o instanceof Product p)) return false;
         return id != null && id.equals(p.id);
     }
-    @Override public int hashCode() { return Objects.hash(id); }
 
-
+    @Override
+    public int hashCode() {
+        return Objects.hash(id);
+    }
 }

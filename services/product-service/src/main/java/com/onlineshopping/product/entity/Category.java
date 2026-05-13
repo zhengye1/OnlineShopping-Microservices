@@ -5,6 +5,7 @@ import lombok.Getter;
 import lombok.Setter;
 
 import java.time.Instant;
+import java.util.Objects;
 
 @Entity
 @Table(name = "categories")
@@ -40,6 +41,7 @@ public class Category {
     @Version
     @Column(nullable = false)
     private Long version;
+
     @PrePersist
     void onCreate() {
         Instant now = Instant.now();
@@ -58,5 +60,18 @@ public class Category {
 
     public boolean isDeleted() {
         return deletedAt != null;
+    }
+
+    // equals/hashCode by id (entity identity)
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Category c)) return false;
+        return id != null && id.equals(c.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id);
     }
 }
