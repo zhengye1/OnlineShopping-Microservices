@@ -24,13 +24,12 @@ public class CategoryService {
 
     @Transactional
     public Category create(CreateCategoryRequest req){
-        Category c = new Category();
-        c.setId(snowflake.nextId());
-        c.setName(req.name());
-        c.setSlug(req.slug());
-        c.setSortOrder(req.sortOrder());
-
-        Category saved = categoryRepository.save(c);
-        return saved;
+        Category c = Category.builder()
+                .id(snowflake.nextId())
+                .name(req.name())
+                .slug(req.slug())
+                .sortOrder(req.sortOrder())
+                .build();
+        return categoryRepository.save(c);
     }
 }

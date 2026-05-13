@@ -18,15 +18,13 @@ public class ProductService {
     private final ProductRepository productRepo;
     private final OutboxService outboxService;
     private final SnowflakeIdGenerator snowflake;
-    private final ObjectMapper objectMapper;
+
     public ProductService(ProductRepository productRepo,
                           OutboxService outboxService,
-                          SnowflakeIdGenerator snowflake,
-                          ObjectMapper objectMapper) {
+                          SnowflakeIdGenerator snowflake) {
         this.productRepo = productRepo;
         this.outboxService = outboxService;
         this.snowflake = snowflake;
-        this.objectMapper = objectMapper;
     }
     /**
      * 創建 Product + 寫 outbox event，原子操作。
@@ -37,29 +35,24 @@ public class ProductService {
      */
     @Transactional
     public Product create(CreateProductRequest req) {
-        Product p = new Product();
-        p.setId(snowflake.nextId());
-        p.setName(req.name());
-        p.setDescription(req.description());
-        p.setSku(req.sku());
-        p.setPriceCents(req.priceCents());
-        p.setCurrency(req.currency());
-        p.setCategoryId(req.categoryId());
-        p.setStatus(ProductStatus.DRAFT);
-        p.setStockQuantity(req.initialStock() != null ? req.initialStock() : 0);
+        Product p = Product.builder()
+                .id(snowflake.nextId())
+                .name(req.name())
+                .description(req.description())
+                .sku(req.sku())
+                .priceCents(req.priceCents())
+                .currency(req.currency())
+                .categoryId(req.categoryId())
+                .status(ProductStatus.DRAFT)
+                .stockQuantity(req.initialStock() != null ? req.initialStock() : 0)
+                .build();
 
         // 2. Save entity
         Product saved = productRepo.save(p);
 
         // 3. Build + record event (same transaction, MANDATORY enforcement)
         ProductCreatedEvent event = ProductCreatedEvent.from(saved);
-        try {
-            String payload = objectMapper.writeValueAsString(event);
-            outboxService.record("ProductCreated", String.valueOf(saved.getId()), payload);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("Failed to serialize ProductCreatedEvent", e);
-        }
-
+        outboxService.record("ProductCreated", String.valueOf(saved.getId()), event);
         return saved;
     }
     @Transactional(readOnly = true)

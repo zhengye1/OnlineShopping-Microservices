@@ -1,12 +1,18 @@
-# Test profile config — Testcontainers will inject DataSource at runtime via @ServiceConnection.
-# 呢度只放 non-DataSource overrides；DB URL / username / password 由 Testcontainers 動態 set。
+# Testcontainers injects DataSource via @ServiceConnection.
 spring:
   jpa:
     hibernate:
       ddl-auto: validate
-    show-sql: true                  # 測試時開晒 SQL log 方便 debug
+    show-sql: true
   flyway:
     enabled: true
+
+# Snowflake — same as main but explicit for test isolation
+app:
+  snowflake:
+    datacenter-id: 1
+    worker-id: 2                # ← deliberately different from main's worker-id=1
+    #   to detect any test-vs-prod ID collision smell
 
 logging:
   level:
