@@ -106,7 +106,6 @@ class ProductServiceTest {
         verify(outboxService).record(anyString(), anyString(), any());
     }
 
-    // TODO 3: findById_existingProduct_returns
     @Test
     void findById_existingProduct_returnsProduct() {
         // given
