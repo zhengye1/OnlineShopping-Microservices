@@ -1,0 +1,20 @@
+# Testcontainers injects DataSource via @ServiceConnection.
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+  flyway:
+    enabled: true
+
+# Snowflake — same as main but explicit for test isolation
+app:
+  snowflake:
+    datacenter-id: 1
+    worker-id: 2                # ← deliberately different from main's worker-id=1
+    #   to detect any test-vs-prod ID collision smell
+
+logging:
+  level:
+    com.onlineshopping: DEBUG
+    org.testcontainers: INFO
