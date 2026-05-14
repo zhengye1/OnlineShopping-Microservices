@@ -549,13 +549,308 @@ L5 deliberately 跳咗以下 production concerns，記錄做 future refactor can
 
 ## 12. Homework / Reflection
 
-完 lesson 之前自問（解答下節 L6 開始時 fold 入 collapsible block）：
+完 lesson 之前自問（解答喺 L6 開始時 fold 入 collapsible block）：
 
 1. 你 `OutboxPoller` 用 `@Scheduled(fixedDelay = 1000)`。如果 L8 product-service horizontal scale 到 5 個 instance，每個 instance 個 poller 都 fire — 5 個 poller 同時撈 pending outbox rows，會點？提示：concurrent `SELECT ... WHERE published_at IS NULL` 嘅 race condition。寫出 SQL-level fix。
 2. `ProductCreatedEvent.eventVersion` 而家 hardcode `1`。如果你下個月要加 `discountedPriceCents Long` (nullable) — 升 v2？保持 v1？解釋你嘅 decision 嘅 backward-compat 含意。如果再下個月要 break-change `priceCents` 由 cents 變 BigDecimal，consumer 升級嘅 rollout plan 點寫？
 3. 你 `Product.categoryId` 用 `Long` 唔用 `@ManyToOne Category`。L9 將來如果 Category 抽出獨立 service，呢個 plain Long reference 嘅 implication 點？如果係 `@ManyToOne` reference 又會點？
 4. Snowflake `worker_id` 而家 hardcode `1`。**寫 pseudo-code 演示**用 Zookeeper sequential node 落地動態分配 worker_id 嘅流程（claim → use → release on shutdown）。如果 service crash 唔 release 點？
 5. `ProductService.findById()` throw `ResponseStatusException(NOT_FOUND)` 係 Spring shortcut (Approach A)。如果你下個月要支援 gRPC 同 CLI 兩個 protocol，你會 refactor 落 Approach B (domain exception + `@RestControllerAdvice`)？解釋 refactor steps + 點 keep HTTP API contract 不變。
+
+<details>
+<summary><strong>📖 Polished Solutions (L6 session fold-back)</strong></summary>
+
+> 小V 嘅 cold-attempt notes:
+> - **Q2**: 「應該加 version」— 啱方向，但要 unpack additive vs breaking
+> - **Q3**: 「拆開 join 會 break」— 啱方向，但 actual 答案反直覺
+> - **Q5**: 「中央處理 exception 嘅角色」— 答中核心
+> - **Q1 / Q4**: cold — 全新 concept
+
+---
+
+### Q1 — Outbox horizontal-scale race + SQL-level fix
+
+**Problem：** 5 個 product-service instance 同時跑，每個 instance 嘅 `OutboxPoller` `@Scheduled(fixedDelay = 1000)` fire 一次：
+
+```sql
+SELECT * FROM outbox_events WHERE published_at IS NULL LIMIT 100;
+```
+
+5 個 poller 都撈到**同一批 rows** → 每個都嘗試 publish → Kafka 收到**重複 5 次** → 即使 consumer side idempotent dedupe，都係 5x 流量浪費咗，仲未計 publish 失敗 / partial commit 嘅 edge case。
+
+**Fix — `FOR UPDATE SKIP LOCKED` (MySQL 8 / PostgreSQL 9.5+)：**
+
+```sql
+SELECT * FROM outbox_events
+WHERE published_at IS NULL
+ORDER BY id
+LIMIT 100
+FOR UPDATE SKIP LOCKED;
+```
+
+**機制：**
+- `FOR UPDATE` → 對 SELECT 返嘅 rows 攞 **row-level exclusive lock**，要 commit / rollback 先 release
+- `SKIP LOCKED` → 如果其他 transaction 已 lock 咗呢啲 row，**跳過 (唔等)**，撈下一批未 locked 嘅
+
+**多 instance 嘅 timeline：**
+```
+T=0  Instance A: SELECT FOR UPDATE SKIP LOCKED → 撈 row 1-100，lock 住
+T=0  Instance B: SELECT FOR UPDATE SKIP LOCKED → row 1-100 已 locked → 跳過 → 撈 row 101-200
+T=0  Instance C: SELECT FOR UPDATE SKIP LOCKED → 1-200 locked → 撈 201-300
+```
+
+**對比唔加 `SKIP LOCKED`：** 其他 instance 會 **block + wait** 直到 A commit — DB connection pool exhausted (呢個 root cause flavor 同 FDR DB story 同源)。
+
+**Spring 落地：**
+```java
+@Query(value = """
+    SELECT * FROM outbox_events
+    WHERE published_at IS NULL
+    ORDER BY id
+    LIMIT :limit
+    FOR UPDATE SKIP LOCKED
+    """, nativeQuery = true)
+List<OutboxEvent> findPendingForUpdate(@Param("limit") int limit);
+```
+
+呼叫嘅 method 必須 `@Transactional`，否則 lock 即時 release 無意義。
+
+---
+
+### Q2 — Event versioning rollout
+
+**Sub-Q2a — 加 `discountedPriceCents Long` (nullable)：唔使升 version**
+
+**前提：** consumer 用 `@JsonIgnoreProperties(ignoreUnknown = true)` 或 Jackson default forgiving mode。
+
+**Backward-compat reasoning：**
+- 舊 consumer 嘅 DTO 無 `discountedPriceCents` field → Jackson 靜默 drop unknown field
+- 新 consumer 嘅 DTO 有 field → 收到 v1 event (無 field) → 自動 default 為 `null`
+- Producer 升咗有時加 / 有時無 — consumer 兩邊都 OK
+
+**Rule of thumb：**
+| Change | Compatible? | Version bump? |
+|---|---|---|
+| Adding optional field | ✅ | No |
+| Removing field | ❌ | Yes |
+| Renaming field | ❌ | Yes |
+| Changing field type | ❌ | Yes |
+| Changing field semantic (e.g. cents → dollars) | ❌ (silent corruption!) | Yes |
+
+**Sub-Q2b — `priceCents Long` → `price BigDecimal`：必須升 v2 + dual-publish rollout**
+
+**點解 dual-publish？** 你 cannot:
+- 一晚 deploy 全部 consumer + producer — N 個 service 散晒，blast radius 太大
+- 只升 producer — 舊 consumer deserialize `BigDecimal` 入 `Long` field → 即時爆
+- 只升 consumer — producer 仲未出新 format → consumer wait 到天荒地老
+
+**Rollout plan (safe deprecation window)：**
+
+```
+Phase 1 (Week 1) — Producer 升級
+   Producer 同時 publish v1 + v2 兩個 event：
+   - Topic `product-events-v1` (legacy format, priceCents Long)
+   - Topic `product-events-v2` (new format, price BigDecimal)
+   Consumer 仲淨 subscribe v1 → 無感覺
+
+Phase 2 (Week 2-3) — Consumer 逐個 migrate
+   Consumer A → cut over 去 v2
+   Consumer B → cut over 去 v2
+   Consumer C → cut over 去 v2
+   (per-service rollback 容易，rollback 只係單一 consumer 切返 v1)
+
+Phase 3 (Week 4) — Sunset v1
+   驗證所有 consumer 都 on v2 (查 v1 topic consumer group lag = 0)
+   → Producer 停發 v1
+   → 刪 v1 topic
+```
+
+**真實世界類比：** gRPC `proto2 → proto3`、Kafka itself 嘅 message version byte、Slack API v1 → v2。
+
+---
+
+### Q3 — `Long categoryId` vs `@ManyToOne Category` — 反直覺結論
+
+當 monolith 之內，兩個 design 嘅 surface API 睇落差唔多。但**為未來 service split 留後路**嘅角度，差好遠：
+
+| 維度 | `Long categoryId` (而家嘅 design) | `@ManyToOne Category category` |
+|---|---|---|
+| **DB FK constraint** | 無 — already loose coupling | 有 — cut service 之前要 drop FK |
+| **JPA fetch behavior** | 已經 manual：`categoryRepo.findById(p.getCategoryId())` | Auto lazy load：`product.getCategory().getName()` |
+| **Business code 散佈** | Fetch site 集中 (你被迫 explicit) | 散晒喺 service / template / DTO mapper — 寫嗰陣覺得方便，refactor 嗰陣痛苦 |
+| **L9 cut Category service 嘅 migration scope** | **細**：將 `categoryRepo.findById` 換做 `categoryClient.fetch(id)` (REST / gRPC) | **大**：drop FK + grep `getCategory()` 全部 callsites + 加 client + handle network failure / timeout / retry / fallback |
+| **Bonus capability** | 加 `categoryNameSnapshot String` field 唔再 query 都得 | 想 snapshot 都難，JPA 強迫你 live join |
+
+**Takeaway：**
+- `Long categoryId` 唔係懶嘅 design — 係**有意識嘅 cross-aggregate boundary discipline**
+- `@ManyToOne` 喺 monolith 內舒服，但 L9 cut service 嗰陣痛
+- 呢個係 "**preparing the monolith for split**" 嘅 Strangler Fig 配套技巧 — 即使未 cut service，aggregate boundary 寫法已經要 service-ready
+
+**唔代表 `@ManyToOne` 永遠唔好：** 同一 aggregate 內 (e.g. `Product ↔ ProductImage` intra-aggregate) 用 `@ManyToOne` / `@OneToMany` 啱嘅。Rule：**aggregate 內 reference 用 JPA association；aggregate 之間 (尤其未來可能 cut service 嗰啲) 用 plain ID。**
+
+---
+
+### Q4 — Zookeeper ephemeral sequential allocation
+
+**Mental model：**
+- ZK = distributed coordination service (key-value store with watches)
+- **Ephemeral node** = session 死 (process crash / network drop / explicit close) → node 自動消失
+- **Sequential node** = ZK 自動 append monotonic counter suffix
+
+**Pseudo-code：**
+
+```java
+public class SnowflakeWorkerIdAllocator {
+    private static final int WORKER_ID_BITS = 5;
+    private static final int MAX_WORKERS = 1 << WORKER_ID_BITS;  // 32
+    private ZooKeeper zk;
+    private String myPath;
+    private int workerId;
+
+    @PostConstruct
+    public int allocate() throws Exception {
+        // 1. CONNECT — establish ZK session
+        zk = new ZooKeeper("zk-cluster:2181", SESSION_TIMEOUT_MS, sessionWatcher);
+
+        // 2. CLAIM — create ephemeral sequential node under /snowflake/workers/
+        myPath = zk.create(
+            "/snowflake/workers/worker-",
+            getHostname().getBytes(StandardCharsets.UTF_8),  // metadata: who owns this slot
+            ZooDefs.Ids.OPEN_ACL_UNSAFE,
+            CreateMode.EPHEMERAL_SEQUENTIAL
+        );
+        // myPath e.g. "/snowflake/workers/worker-0000000007"
+
+        // 3. USE — extract suffix → mod 32 → worker_id
+        int sequenceNum = parseSuffix(myPath);  // 7
+        workerId = sequenceNum % MAX_WORKERS;   // 7 % 32 = 7
+
+        // 4. SAFETY — 過度 claim 防 saturation
+        if (countActiveWorkers() > MAX_WORKERS) {
+            zk.delete(myPath, -1);
+            throw new IllegalStateException("Snowflake worker slots exhausted (>32 active)");
+        }
+
+        log.info("Allocated worker_id={} via path={}", workerId, myPath);
+        return workerId;
+    }
+
+    // 5. RELEASE — graceful shutdown
+    @PreDestroy
+    public void shutdown() {
+        zk.close();  // ZK session close → ephemeral node 即時消失 → slot 釋放
+    }
+
+    // 6. CRASH HANDLING — 乜都唔使做!
+    //    Process die → ZK 偵測 session timeout (typically 10-30s)
+    //    → ZK 自動刪 ephemeral node → slot 自動 release → 下個 instance claim 新 sequential 號
+}
+```
+
+**Crash 嘅關鍵：**
+> **你乜都唔使寫。** Ephemeral 個 promise 就係 session 死 = node 死。Process crash / kill -9 / hardware failure 全部 work。
+
+**Edge case 必須注意：**
+
+1. **Sequential counter overflow** — ZK sequential 係 monotonic increasing int，數字一路升 (7 → 1007 → 1000007)，所以**一定要 `% 32`** 才落 worker_id。
+2. **Split-brain (network partition / GC pause > session timeout)** — 你個 ZK session expire 咗，但 process 仲生 (e.g. STW GC pause 60s)。ZK 已刪你個 ephemeral node → 另一個 instance 起身 claim 咗你個 sequence slot → 兩個 instance 同一個 worker_id → **Snowflake duplicate ID 災難**。
+   **Mitigation：** 喺 process 入面 register session watcher，收到 `KeeperState.Expired` 即時 **panic + exit** — 唔好繼續發 ID。靠 K8s / supervisor 重啟拎新 slot。
+3. **ZK cluster 自己死晒** — Snowflake generation 停 (fail closed) > 繼續發可能 duplicate 嘅 ID (fail open)。
+
+---
+
+### Q5 — Approach A (Spring shortcut) → Approach B (domain exception + advice) refactor
+
+**Approach A (現狀):**
+```java
+public Product findById(Long id) {
+    return repo.findById(id)
+        .filter(p -> p.getDeletedAt() == null)
+        .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found"));
+}
+```
+`ResponseStatusException` 嚟自 `org.springframework.web.server` — **綁死 HTTP semantics**，service layer 提早 commit 咗 HTTP contract。
+
+**Approach B (refactored):**
+
+**Step 1 — 加 domain exception (純 domain，唔知 HTTP)**
+```java
+package com.onlineshopping.product.exception;
+
+public class ProductNotFoundException extends RuntimeException {
+    private final Long productId;
+
+    public ProductNotFoundException(Long id) {
+        super("Product " + id + " not found");
+        this.productId = id;
+    }
+
+    public Long getProductId() { return productId; }
+}
+```
+
+**Step 2 — Service throw domain exception**
+```java
+public Product findById(Long id) {
+    return repo.findById(id)
+        .filter(p -> p.getDeletedAt() == null)
+        .orElseThrow(() -> new ProductNotFoundException(id));
+}
+```
+Service layer 而家 **protocol-agnostic** — 唔 import 任何 `org.springframework.web` 嘅嘢。
+
+**Step 3 — HTTP 層 translate (RestControllerAdvice)**
+```java
+@RestControllerAdvice
+public class ProductExceptionHandler {
+    @ExceptionHandler(ProductNotFoundException.class)
+    public ResponseEntity<ApiError> handle(ProductNotFoundException e) {
+        return ResponseEntity
+            .status(HttpStatus.NOT_FOUND)
+            .body(ApiError.of("PRODUCT_NOT_FOUND", e.getMessage()));
+    }
+}
+```
+
+**Step 4 — Integration test verify HTTP contract unchanged**
+- Status code 仍然 `404`
+- Response body shape 仍然 `{"error": "...", "code": "..."}`
+- 任何 existing client 唔需要改
+
+**Multi-protocol payoff：**
+
+```java
+// gRPC interceptor — 同一 domain exception，translate 成 gRPC Status
+public class GrpcExceptionInterceptor implements ServerInterceptor {
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(...) {
+        try {
+            return next.startCall(call, headers);
+        } catch (ProductNotFoundException e) {
+            call.close(Status.NOT_FOUND.withDescription(e.getMessage()), new Metadata());
+        }
+    }
+}
+
+// CLI — 直接 catch domain exception，friendly message
+try {
+    Product p = productService.findById(id);
+    System.out.println(p);
+} catch (ProductNotFoundException e) {
+    System.err.println("[error] " + e.getMessage());
+    System.exit(1);
+}
+```
+
+**Approach B 嘅成本：** 多兩個 class (domain exception + advice)。**收益：**
+- 多 protocol 各自 translate 同一個 domain exception，零 service layer 改動
+- Domain exception 帶 structured data (`productId`)，HTTP / gRPC / CLI 可以各自 format
+- Service layer 更易 unit test — 唔再 mock HTTP infra
+
+**Rule of thumb：**
+- 1 protocol (HTTP only) + 唔會擴展 → Approach A 夠
+- ≥ 2 protocol OR domain exception 帶 metadata OR aggressively unit-test service layer → Approach B
+
+</details>
 
 ---
 
