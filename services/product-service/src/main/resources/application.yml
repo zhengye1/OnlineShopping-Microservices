@@ -35,6 +35,20 @@ spring:
     locations: classpath:db/migration
     validate-on-migrate: true
 
+  # ===== Kafka producer (L6 cross-service event publish) =====
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9094}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all                                  # 等所有 in-sync replica ack — max durability
+      retries: 3                                 # 失敗 auto retry 3 次 (network glitch tolerant)
+      properties:
+        enable.idempotence: true                 # producer 內部 sequence-number dedup (broker-side)
+        max.in.flight.requests.per.connection: 5 # idempotence 要求 ≤ 5
+        delivery.timeout.ms: 10000               # 整個 send 操作 timeout
+        request.timeout.ms: 5000                 # 單次 broker request timeout
+
 
 # ===== Server =====
 server:
@@ -56,3 +70,6 @@ app:
   snowflake:
     datacenter-id: 1    # L5: hardcode 1 for product-service
     worker-id: 1        # L5: hardcode 1 (single instance)
+  kafka:
+    topic:
+      product-events: product-events   # L6 cross-service event topic

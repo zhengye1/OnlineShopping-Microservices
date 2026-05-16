@@ -53,6 +53,12 @@
             <artifactId>flyway-mysql</artifactId>
         </dependency>
 
+        <!-- ===== Kafka (L6 cross-service event publish) ===== -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
         <!-- ===== Security + JWT ===== -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
