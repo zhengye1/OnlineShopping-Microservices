@@ -4,35 +4,50 @@ import com.onlineshopping.product.entity.OutboxEvent;
 import com.onlineshopping.product.repository.OutboxEventRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 
 /**
- * Background poller for the transactional outbox.
+ * Background poller — drains outbox table to Kafka topic.
  *
- * <p>Every {@code app.outbox.poll-interval-ms} (default 1 sec), scans for
- * pending events (FIFO by id) and "publishes" them.
+ * <p>L6 upgrade: replaces the L4 console-log placeholder with real
+ * {@link KafkaTemplate} publish. Synchronous {@code .get()} on the send
+ * future is the cornerstone of at-least-once delivery — broker must ack
+ * before {@code published_at} is set; any failure (broker down, network)
+ * leaves the row in pending state for the next poll to retry.
  *
- * <p><b>L4 implementation</b>: events are logged to console — proves the
- * pattern works end-to-end. L7+ replaces the log call with a real Kafka /
- * SNS producer; downstream services (cart-service, notification-service)
- * subscribe and de-dupe by event id (consumer-side idempotency).
+ * <p>Partitioning: {@code aggregateId} (productId) is used as Kafka
+ * partition key — all events for the same product go to the same
+ * partition, preserving per-product ordering across consumers.
  *
- * <p>Concurrency: the entire poll runs in a single {@code @Transactional}
- * scope. If multiple pollers run (e.g. horizontal scale of product-service),
- * a refinement is to switch the read to {@code SELECT ... FOR UPDATE
- * SKIP LOCKED} — beyond L4 scope.
+ * <p>Failure isolation: a single event's publish failure does not abort
+ * the batch — successful events still get {@code published_at} set, and
+ * the failed event retries next poll. Consumer-side idempotency
+ * (dedupe by {@code eventId} in payload) covers duplicates.
  */
 @Component
 @RequiredArgsConstructor
 @Slf4j
 public class OutboxPoller {
 
+    private static final String HEADER_EVENT_TYPE = "eventType";
+
     private final OutboxEventRepository outboxRepo;
+    private final KafkaTemplate<String, String> kafkaTemplate;
+
+    @Value("${app.kafka.topic.product-events}")
+    private String productEventsTopic;
 
     @Scheduled(fixedDelayString = "${app.outbox.poll-interval-ms:1000}")
     @Transactional
@@ -43,13 +58,49 @@ public class OutboxPoller {
         }
 
         Instant now = Instant.now();
+        int succeeded = 0;
+        int failed = 0;
         for (OutboxEvent event : pending) {
-            // L4: log only. L7+ replaces with kafkaTemplate.send(topic, event.id, event.payload).
-            log.info("[outbox] PUBLISH id={} type={} aggregate={} payload={}",
-                    event.getId(), event.getEventType(), event.getAggregateId(), event.getPayload());
-            event.setPublishedAt(now);
+            if (publish(event)) {
+                event.setPublishedAt(now);
+                succeeded++;
+            } else {
+                failed++;
+            }
         }
         outboxRepo.saveAll(pending);
-        log.debug("[outbox] published {} events", pending.size());
+        log.info("[outbox] poll batch processed: succeeded={} failed={} (failed will retry next poll)",
+                succeeded, failed);
+    }
+
+    private boolean publish(OutboxEvent event) {
+        ProducerRecord<String, String> record = new ProducerRecord<>(
+                productEventsTopic,
+                null,                          // partition: let Kafka hash partition key
+                event.getAggregateId(),        // key: productId → same partition per product
+                event.getPayload()             // value: JSON payload (already serialized)
+        );
+        record.headers().add(new RecordHeader(
+                HEADER_EVENT_TYPE,
+                event.getEventType().getBytes(StandardCharsets.UTF_8)
+        ));
+
+        try {
+            SendResult<String, String> result = kafkaTemplate.send(record).get();
+            log.info("[outbox] published outboxId={} type={} aggregate={} → topic={} partition={} offset={}",
+                    event.getId(), event.getEventType(), event.getAggregateId(),
+                    result.getRecordMetadata().topic(),
+                    result.getRecordMetadata().partition(),
+                    result.getRecordMetadata().offset());
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("[outbox] publish interrupted outboxId={} type={}", event.getId(), event.getEventType());
+            return false;
+        } catch (ExecutionException e) {
+            log.error("[outbox] publish FAILED outboxId={} type={} — will retry next poll",
+                    event.getId(), event.getEventType(), e.getCause());
+            return false;
+        }
     }
 }

@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: inventory-service
+
+  datasource:
+    url: jdbc:mysql://localhost:3309/inventory_service?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: ${DB_USER:inventory_service}
+    password: ${DB_PASSWORD:inventory_service_pw}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+    show-sql: false
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+
+# ===== Kafka consumer (L6 cross-service event consumption) =====
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9094}
+    consumer:
+      group-id: inventory-service
+      auto-offset-reset: earliest # new group 由 topic 開頭讀；已 commit 過嘅 group 由 last offset
+      enable-auto-commit: false # 禁 Kafka native auto-commit
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+    listener:
+      ack-mode: MANUAL_IMMEDIATE
+      missing-topics-fatal: false
+
+server:
+  port: 8083
+
+logging:
+  level:
+    com.onlineshopping: DEBUG
+    org.hibernate.SQL: INFO
+
+app:
+  kafka:
+    topic:
+      product-events: product-events  # 對齊 producer 嘅 topic name

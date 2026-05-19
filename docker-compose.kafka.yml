@@ -1,0 +1,102 @@
+# Shared Kafka cluster for cross-service event-driven communication.
+#
+# 兩個 service (product-service / inventory-service) 都 connect 到呢個 cluster。
+# 屬於 cross-service shared infra，所以放 root level (唔放任何單一 service 入面)。
+#
+# Usage:
+#   docker compose -f docker-compose.kafka.yml up -d            # start Kafka stack
+#   docker compose -f docker-compose.kafka.yml logs -f kafka    # tail Kafka broker logs
+#   docker compose -f docker-compose.kafka.yml ps               # show running containers
+#   docker compose -f docker-compose.kafka.yml down             # stop (data 保留)
+#   docker compose -f docker-compose.kafka.yml down -v          # stop + WIPE data
+#
+# Kafka UI (visual broker + topic + consumer-group debugger):
+#   http://localhost:8088
+#
+# Connect from app code (running on HOST):
+#   bootstrap.servers = localhost:9094
+#
+# Connect from another container (e.g. future containerized services):
+#   bootstrap.servers = kafka:9092
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: kafka-zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      # cp-zookeeper 唔 install nc，加上 ruok 4-letter word 預設 disabled，
+      # 改用 Confluent 內置 `cub zk-ready` utility (Confluent 官方 blessed)
+      test: ["CMD-SHELL", "cub zk-ready localhost:2181 5"]
+      interval: 10s
+      timeout: 15s
+      retries: 5
+      start_period: 20s
+    networks:
+      - kafka-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-broker
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9094:9094"                                                              # external listener — for host-side apps
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # Dual-listener pattern — 一個 listener 畀 container 內部 talk (PLAINTEXT://kafka:9092)，
+      # 另一個畀 host 上嘅 app talk (EXTERNAL://localhost:9094)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1                                  # single broker dev cluster
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0                                  # dev: 唔等 group rebalance
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"                                   # 強迫 explicit topic creation — production discipline
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+    networks:
+      - kafka-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8088:8080"                                                              # http://localhost:8088
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092                              # UI 喺 container 內部 → 用 internal listener
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks:
+      - kafka-net
+
+volumes:
+  kafka_data:
+    name: kafka_broker_data
+
+networks:
+  kafka-net:
+    name: kafka-net
+    driver: bridge
