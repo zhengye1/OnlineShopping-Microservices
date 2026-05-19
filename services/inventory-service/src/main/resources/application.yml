@@ -1,0 +1,39 @@
+spring:
+  application:
+    name: inventory-service
+
+  datasource:
+    url: jdbc:mysql://localhost:3309/inventory_service?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: ${DB_USER:inventory_service}
+    password: ${DB_PASSWORD:inventory_service_pw}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+    show-sql: false
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+
+  # Kafka consumer config 留低 6.5 加 — 而家只放空殼
+
+server:
+  port: 8083
+
+logging:
+  level:
+    com.onlineshopping: DEBUG
+    org.hibernate.SQL: INFO
