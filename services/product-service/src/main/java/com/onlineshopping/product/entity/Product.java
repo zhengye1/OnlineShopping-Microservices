@@ -36,6 +36,7 @@ public class Product {
 
     @Column(nullable = false, length = 3)
     @JdbcTypeCode(SqlTypes.CHAR)
+    @Builder.Default
     private String currency = "CAD";
 
     @Column(name = "category_id", nullable = false)
@@ -43,9 +44,11 @@ public class Product {
 
     @Enumerated(EnumType.STRING)                // ← ⭐ 強制 STRING，避免 ORDINAL 災難
     @Column(nullable = false, length = 32)
+    @Builder.Default
     private ProductStatus status = ProductStatus.DRAFT;
 
     @Column(name = "stock_quantity", nullable = false)
+    @Builder.Default
     private Integer stockQuantity = 0;
 
     @Column(name = "created_at", nullable = false, updatable = false)
@@ -62,6 +65,7 @@ public class Product {
     private Long version;
 
     @OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @Builder.Default
     private List<ProductImage> images = new ArrayList<>();
 
     @PrePersist
