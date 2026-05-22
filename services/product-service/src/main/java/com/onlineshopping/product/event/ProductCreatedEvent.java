@@ -17,7 +17,8 @@ public record ProductCreatedEvent(String eventId,           // UUID — consumer
                                   Long priceCents,
                                   String currency,
                                   Long categoryId,
-                                  String status) {
+                                  String status,
+                                  Integer initialStock) {   // L7: propagate stock to inventory-service
     public static ProductCreatedEvent from(Product p) {
         return new ProductCreatedEvent(
                 UUID.randomUUID().toString(),
@@ -30,7 +31,8 @@ public record ProductCreatedEvent(String eventId,           // UUID — consumer
                 p.getPriceCents(),
                 p.getCurrency(),
                 p.getCategoryId(),
-                p.getStatus().name()
+                p.getStatus().name(),
+                p.getStockQuantity()
         );
     }
 }

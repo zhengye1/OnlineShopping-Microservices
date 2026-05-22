@@ -26,6 +26,7 @@ public record ProductCreatedEvent(
         Long priceCents,
         String currency,
         Long categoryId,
-        String status
+        String status,
+        Integer initialStock        // L7: nullable for backward-compat with pre-L7 messages
 ) {
 }

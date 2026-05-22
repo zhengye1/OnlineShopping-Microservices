@@ -49,12 +49,14 @@ public class InventoryService {
             log.info("Inventory row already exists for productId={} — recording dedup only " +
                     "(likely offset reset replay)", event.productId());
         } else {
+            int initialStock = event.initialStock() != null ? event.initialStock() : 0;
             Inventory inv = Inventory.builder()
                     .productId(event.productId())
-                    .stockQuantity(0)
+                    .stockQuantity(initialStock)
                     .build();
             inventoryRepo.save(inv);
-            log.info("Inventory initialised: productId={} sku={}", event.productId(), event.sku());
+            log.info("Inventory initialised: productId={} sku={} stock={}",
+                    event.productId(), event.sku(), initialStock);
         }
 
         ProcessedEvent dedup = ProcessedEvent.builder()
