@@ -47,10 +47,11 @@ server:
 # ===== Application-specific config =====
 app:
   jwt:
-    # ⚠️ Dev fallback — prod 必須 override via env var
-    secret: ${JWT_SECRET:dev-only-secret-please-override-in-production-min-256-bits-long-aaaaaaaaaaaaaaaa}
     expiration-minutes: ${JWT_EXPIRATION_MINUTES:60}
     issuer: user-service
+    private-key: classpath:keys/jwt-private.pem
+    public-key: classpath:keys/jwt-public.pem
+    key-id: ${JWT_KEY_ID:dev-key-2026-05}
 
 # ===== Logging =====
 logging:
