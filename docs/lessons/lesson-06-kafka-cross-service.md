@@ -760,6 +760,616 @@ L6 揀 `processed_events` table — 為將來 `ProductPriceUpdated` 等 complex 
 
 5. **KRaft mode migration** — 你嘅 docker-compose 用 Zookeeper。寫出 migration steps：(a) 點 prepare Kafka cluster (3 brokers → 3 KRaft controllers)？(b) `kafka-storage` CLI 嘅 format step 做咩？(c) Rolling restart sequence — broker by broker upgrade 同 metadata migrate 順序？(d) **Risk** — 如果 mid-migration controller quorum 失敗，點 rollback？
 
+<details>
+<summary><strong>📖 Polished Solutions (L7 session fold-back)</strong></summary>
+
+> 小V 嘅 cold-attempt notes:
+> - **Q1.1-1.3**: 答得好 — `product-events.DLT` naming convention + metadata 內容都 bullseye
+> - **Q1.4 (transient vs permanent)**: cold — 教咗 mental model
+> - **Q2**: 只 self-aware 答到 `Thread.sleep` + 自己已 doubt "失去 async 意義" — senior thinking 起點，淨係未識個 library 名 `Awaitility`
+> - **Q3**: 「v1 / v2 topic naming」方向啱、incomplete — miss 咗 in-payload version + schema registry 兩條 dimension
+> - **Q4 / Q5**: cold surrender — 全新 production-ops concept，要做過 oncall / migration 先會熟
+
+---
+
+### Q1 — Dead Letter Queue Wiring
+
+**Why DLQ exists：** L6 hands-on 撞過 war story #3 — `DuplicateKeyException` 引發 consumer 無限 retry loop，partition lag 失控累積。Production reality 係：有啲 message 真係 **poison** (payload corrupted、unparseable JSON、refer 不存在 entity)。冇 DLQ 嘅後果 — consumer 永遠 stuck 喺嗰條 poison message，後面成千上萬條 valid event 等住。**DLQ 嘅 purpose 唔係保住嗰條 poison message，係保住「後面所有 valid message」嘅 throughput。**
+
+#### Retry policy + backoff
+
+| Backoff strategy | 適用場景 |
+|---|---|
+| `FixedBackOff(1000ms, 3)` | 簡單、predictable — 適合 transient 故障 likely 快速恢復 |
+| **`ExponentialBackOff(1s → 2s → 4s, max 10s)`** ⭐ | Production default — 避免 thundering herd，downstream overload 嘅時候 polite 退讓 |
+
+Spring Kafka **default** 係 `FixedBackOff(0L, 9L)` — 0ms delay × 9 retries = 10 attempts。0ms 解釋咗 L6 war story #3 點解 consumer 瘋狂 retry — default policy 連 1ms 都唔等。Production 一定要 override。
+
+#### Topic naming convention
+
+```
+product-events       ← 主 topic
+product-events.DLT   ← Spring Kafka DeadLetterPublishingRecoverer default convention
+```
+
+`.DLT` = Dead Letter **Topic** (Spring Kafka 嘅 trademark 命名)。識呢條 convention = 用過 Spring Kafka in production 嘅 signal。
+
+#### DLT message metadata (Spring 自動帶)
+
+```
+kafka_dlt-original-topic           = "product-events"
+kafka_dlt-original-partition       = 2
+kafka_dlt-original-offset          = 145782
+kafka_dlt-original-timestamp       = 1716123456789
+kafka_dlt-exception-fqcn           = "org.springframework.dao.DataIntegrityViolationException"
+kafka_dlt-exception-message        = "Duplicate entry '315140602960416768'..."
+kafka_dlt-exception-stacktrace     = "...full stack..."
+```
+
+**Why 要全部留：** 之後人工 review DLT 需要 (a) original topic/partition/offset 做 replay，(b) exception class 做分類，(c) stack trace 做 forensic。淨係留 payload 等於 "證物冇 chain of custody"。
+
+#### Transient vs Permanent — 核心 mental model
+
+| Type | 例子 exceptions | Retry? | Why |
+|---|---|---|---|
+| **Transient** (網絡 / contention) | `SocketTimeoutException`, `TransientDataAccessException`, `OptimisticLockException`, `KafkaTimeoutException` | ✅ Retry with backoff | 過陣會自己好返 — DB momentary spike、concurrent write conflict、network glitch |
+| **Permanent** (data shape / business rule) | `DataIntegrityViolationException`, `JsonParseException`, `MethodArgumentNotValidException`, `IllegalArgumentException` | ❌ Instant DLT | Retry 1000 次都同一個 exception — 浪費 cycles + block pipeline |
+
+呢個 classification 就係 L6 war story #3 嘅 root cause —`DuplicateKeyException` 屬於 **permanent** 但 Spring default policy retry 緊。完整 fix = dedup guard (prevention) + DLQ classification (containment) 兩層都要有。
+
+#### Complete Spring Kafka wiring
+
+```java
+@Configuration
+public class KafkaErrorHandlerConfig {
+
+    @Bean
+    public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> template) {
+        // ① DLT recoverer — 寄去 <originalTopic>.DLT
+        var recoverer = new DeadLetterPublishingRecoverer(template);
+
+        // ② Exponential backoff: 1s → 2s → 4s, capped 10s, max 3 retries
+        var backoff = new ExponentialBackOff(1000L, 2.0);
+        backoff.setMaxInterval(10_000L);
+        backoff.setMaxElapsedTime(30_000L);   // 30s 內未成功就 DLT
+
+        var handler = new DefaultErrorHandler(recoverer, backoff);
+
+        // ③ Permanent failures — 跳過 retry，直接 DLT
+        handler.addNotRetryableExceptions(
+            DataIntegrityViolationException.class,
+            JsonParseException.class,
+            IllegalArgumentException.class,
+            MethodArgumentNotValidException.class
+        );
+
+        return handler;
+    }
+}
+```
+
+`ConcurrentKafkaListenerContainerFactory` 入面 inject：
+
+```java
+factory.setCommonErrorHandler(kafkaErrorHandler);
+```
+
+#### Replay mechanism (interview follow-up)
+
+DLT 唔係終點，係 **quarantine**。Replay pattern：
+
+1. 人工 / batch job 由 `product-events.DLT` 讀返出嚟
+2. Inspect exception class + payload，identify root cause + fix
+3. 用 `KafkaTemplate` 寄返去 **原 topic** `product-events`
+4. Producer 帶原 eventId → consumer-side dedup guard handle 任何 by-product duplicate
+
+#### Last-resort 如果 DLT 自己都 fail
+
+`DeadLetterPublishingRecoverer` send DLT fail (broker down、DLT topic 唔存在) → recoverer 自己 throw → `DefaultErrorHandler` 用 `BackOffHandler` 重試 DLT send → 仍然 fail → 配 `addRetryableExceptions(KafkaException.class)` 並上 ELK alert + page oncall。**呢度唔好再 fallback 第 3 層 — broker down 嘅根本問題唔係 application 解決得到。**
+
+---
+
+### Q2 — `@EmbeddedKafka` Integration Test
+
+**Why integration test 唔可以淨係 unit test：** L6 你寫嘅 Mockito unit test 100% green 都唔代表 end-to-end 真係 work — producer 同 consumer **冇真正過過 broker**。Production reality：
+
+- Producer partition key 正確但 consumer group config 撞咗 → message 永遠 stuck
+- Serializer config mismatch → consumer parse 唔到
+- Topic auto-create disabled (你 L6 設定) → typo topic 直接 silent skip
+
+Spring Kafka 提供 `@EmbeddedKafka` — 喺 test JVM in-memory boot 一個真 Kafka broker。
+
+#### Race condition — `Awaitility` 取代 `Thread.sleep`
+
+`Thread.sleep(2000)` 嘅 3 個致命問題：
+
+| 問題 | 後果 |
+|---|---|
+| **Flaky** | CI 機器 load 高 → consumer 用 3s → test fail 但 logic 正確 → build pipeline 紅燈 → trust 下降 |
+| **Slow** | Sleep 2s safety buffer，actual 用 200ms → 每 test 浪費 1.8s × N tests |
+| **Magic number** | 點解 2s 唔係 3s？冇 reasoning + 冇 docs → 6 個月後同事完全唔知點調 |
+
+**Production standard：Awaitility — polling + assertion + timeout 三合一**
+
+```java
+import static org.awaitility.Awaitility.await;
+import static java.util.concurrent.TimeUnit.*;
+
+await().atMost(10, SECONDS)
+       .pollInterval(200, MILLISECONDS)
+       .untilAsserted(() -> 
+           assertThat(inventoryRepo.count()).isEqualTo(1)
+       );
+```
+
+**Sweet spot：**
+- Consumer 200ms 搞掂 → test 200ms break，唔等剩低 9.8s
+- Consumer hang → 10s timeout 報錯，唔 false-positive
+- `pollInterval` 控制頻率 — 200ms 一 check，唔 spam CPU
+
+Maven dependency：
+
+```xml
+<dependency>
+    <groupId>org.awaitility</groupId>
+    <artifactId>awaitility</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+#### Test isolation
+
+```java
+@SpringBootTest
+@EmbeddedKafka(
+    partitions = 1,
+    topics = {"product-events", "product-events.DLT"},
+    brokerProperties = {"listeners=PLAINTEXT://localhost:9092"}
+)
+class ProductEventListenerIT {
+
+    @Test
+    void test1() {
+        // 每個 test 用唯一 consumer group ID → offset state 隔離
+        String groupId = "test-" + UUID.randomUUID();
+        // ...
+    }
+}
+
+// Heavy hammer：每 test 完 wipe Spring context
+@DirtiesContext(classMode = AFTER_EACH_TEST_METHOD)
+```
+
+**Trade-off：** Unique groupId 快 (consumer state reset)，但 broker/DB state 留低；`@DirtiesContext` 100% clean 但慢 5-10×。Production project 通常混用 — fast path 用 unique groupId，DB-heavy test 先 `@DirtiesContext`。
+
+#### Complete integration test
+
+```java
+@SpringBootTest
+@EmbeddedKafka(partitions = 1, topics = {"product-events"})
+@AutoConfigureMockMvc
+@Testcontainers
+class ProductCreatedFlowIT {
+
+    @Container
+    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.0");
+
+    @Autowired MockMvc mockMvc;
+    @Autowired InventoryRepository inventoryRepo;
+    @Autowired OutboxEventRepository outboxRepo;
+
+    @Test
+    void postProduct_publishesEvent_consumerCreatesInventory() throws Exception {
+        // ① POST /products
+        String response = mockMvc.perform(post("/products")
+                .contentType(APPLICATION_JSON)
+                .content("""
+                    {"name":"Widget","sku":"WID-1","priceCents":9900,
+                     "currency":"USD","categoryId":1}
+                    """))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        Long productId = JsonPath.read(response, "$.id");
+
+        // ② Outbox row 立即寫咗
+        await().atMost(2, SECONDS).untilAsserted(() ->
+            assertThat(outboxRepo.findAll())
+                .extracting(OutboxEvent::getAggregateId)
+                .contains(productId.toString())
+        );
+
+        // ③ Inventory row eventually 出現
+        await().atMost(10, SECONDS).untilAsserted(() ->
+            assertThat(inventoryRepo.findById(productId)).isPresent()
+        );
+    }
+}
+```
+
+#### DLT verification pattern
+
+Spin **第二個 consumer 監聽 DLT topic**：
+
+```java
+@Test
+void poisonMessage_isSentToDLT() {
+    var dltConsumer = new DefaultKafkaConsumerFactory<>(
+        Map.of(BOOTSTRAP_SERVERS_CONFIG, embeddedKafka.getBrokersAsString(),
+               GROUP_ID_CONFIG, "dlt-test-" + UUID.randomUUID(),
+               KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+               VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+               AUTO_OFFSET_RESET_CONFIG, "earliest")
+    ).createConsumer();
+    dltConsumer.subscribe(List.of("product-events.DLT"));
+
+    // Poison message — payload 故意爛
+    kafkaTemplate.send("product-events", "key-1", "{ this is not json }");
+
+    await().atMost(10, SECONDS).untilAsserted(() -> {
+        var records = dltConsumer.poll(Duration.ofMillis(100));
+        assertThat(records.count()).isEqualTo(1);
+
+        var dltRecord = records.iterator().next();
+        Header exceptionHeader = dltRecord.headers().lastHeader("kafka_dlt-exception-fqcn");
+        assertThat(new String(exceptionHeader.value()))
+            .contains("JsonParseException");
+    });
+}
+```
+
+---
+
+### Q3 — Schema Versioning Rollout
+
+**呢條題目嘅核心 insight：** 唔係淨係「v1 / v2 topic」嘅 binary 揀擇，而係**因應 change type 揀對應 strategy**。Production 三條路：
+
+| Change type | Strategy | Cost |
+|---|---|---|
+| 加 optional field (e.g. `discountedPriceCents`) | **In-payload `eventVersion` bump (1.0 → 1.1)** + `@JsonIgnoreProperties(ignoreUnknown=true)` | ⚪ 零 — backward compatible |
+| 改 field type / rename / 刪 field | **Topic-per-major-version + dual-publish window** | 🟡 高 — consumer migration |
+| 任何 change，想 broker-side enforce | **Schema registry (Confluent / AWS Glue)** | 🟠 中 — 多個 infra component |
+
+**L6 codebase 已經為 strategy #1 鋪底：** `ProductCreatedEvent.java` 加咗 `@JsonIgnoreProperties(ignoreUnknown = true)` — consumer 容忍 producer 新加 field，唔需要 redeploy。
+
+#### Strategy #1 — Additive field (most common case)
+
+`discountedPriceCents` 屬於 additive nullable field — **唔需要新 topic**：
+
+```java
+// Producer 升級 ProductCreatedEvent v1.1：
+public record ProductCreatedEvent(
+        String eventId,
+        String eventType,
+        Integer eventVersion,                // 由 1 升 2
+        Instant occurredAt,
+        Long productId,
+        String name,
+        // ... existing fields
+        Long discountedPriceCents            // ⭐ 新加 nullable
+) {}
+```
+
+**Rollout sequence：**
+
+1. 升級 producer (product-service) → 開始 publish v1.1 payload，但 `eventVersion=2`
+2. 舊 consumer (`inventory-service`/`audit-service`/`search-service`) 完全唔需要改 — Jackson 因 `@JsonIgnoreProperties(ignoreUnknown=true)` 自動 ignore `discountedPriceCents`
+3. 新 consumer 想用 `discountedPriceCents` 嘅，自己升 DTO 加 field
+4. **No deprecation window needed** — backward 完全 compat
+
+**Schema Registry compatibility setting**: `BACKWARD` (新 schema 可被舊 schema reader 讀) — adding optional field 完全符合。
+
+#### Strategy #2 — Breaking change (rare but needs ceremony)
+
+例如 `priceCents` (Long cents) 改 `priceAmount` (BigDecimal full precision)：
+
+**Topic naming：**
+
+```
+product-events       ← old v1 producer 仍然 publish
+product-events-v2    ← new v2 producer publish (parallel)
+```
+
+**Consumer migration sequence (Strangler Fig pattern)：**
+
+| Phase | Producer | Consumers | Duration |
+|---|---|---|---|
+| 1. Setup | Publish v1 only | Read v1 only | t = 0 |
+| 2. Dual publish | **Publish v1 + v2 (mirror writer)** | Still read v1 | t + 1 week |
+| 3. Migrate 1st consumer | Dual publish | inventory-service cuts to v2 | t + 2 weeks |
+| 4. Migrate 2nd consumer | Dual publish | audit-service cuts to v2 | t + 3 weeks |
+| 5. Migrate last consumer | Dual publish | search-service cuts to v2 | t + 4 weeks |
+| 6. Cleanup | **Publish v2 only** | All on v2 | t + 6 weeks |
+| 7. Delete v1 topic | — | — | t + 8 weeks |
+
+**Schema Registry compatibility setting**: 呢個 case 揀 `NONE` for `product-events-v2` 新 topic — 因為係 fresh start。Old topic 留 `BACKWARD`。
+
+#### Strategy #3 — Confluent Schema Registry
+
+Broker 拒絕 incompatible payload before publish — schema 變成 first-class infra：
+
+| Compat mode | 意思 | 適用 |
+|---|---|---|
+| `BACKWARD` ⭐ | 新 schema 可讀舊 data — consumer 先升級 | Additive change |
+| `FORWARD` | 舊 schema 可讀新 data — producer 先升級 | Removing field |
+| `FULL` | 兩邊都 compat | Strict change |
+| `NONE` | 唔 enforce | Greenfield topic |
+
+Production reality: greenfield 新 system 應該由 day-0 用 Schema Registry — 唔係咁多 schema drift 之後先補救。
+
+---
+
+### Q4 — Consumer Lag Monitoring
+
+**Lag formula：**
+
+```
+lag_messages = broker_latest_offset - consumer_committed_offset
+lag_seconds  = lag_messages / consumption_rate_per_second
+```
+
+#### How to measure (3 paths)
+
+| 方法 | Pros | Cons |
+|---|---|---|
+| **Kafka CLI** `kafka-consumer-groups.sh --describe` | Dev 機即時用 | Manual ops only — 唔可以 alert |
+| **Spring Boot 內置 metrics** (Micrometer + Prometheus) | 零額外 infra，consumer 自我 report | Consumer crash 嘅時候反而 silent (worst case) |
+| **External exporter** (Burrow / Kafka Lag Exporter / kafka-ui) | Broker 角度算 — consumer 死咗都 detect 到 | 多個 component 要 maintain |
+
+**Production answer：兩個都要** — Spring Boot 自我 metrics (fast feedback) + external Burrow (catastrophic detection)。
+
+#### Spring Boot zero-config setup
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: prometheus,health,metrics
+```
+
+Hit `/actuator/prometheus` 自動有：
+
+```
+kafka_consumer_fetch_manager_records_lag{topic="product-events",partition="0"} 12345
+kafka_consumer_fetch_manager_records_lag_max{client_id="..."} 12345
+```
+
+#### Custom `/actuator/kafka-lag` endpoint via AdminClient
+
+```java
+@Component
+@Endpoint(id = "kafka-lag")
+@RequiredArgsConstructor
+public class KafkaLagEndpoint {
+
+    private final AdminClient adminClient;
+    private final KafkaConsumer<String, String> consumer;
+    private static final String TOPIC = "product-events";
+    private static final String GROUP = "inventory-service";
+
+    @ReadOperation
+    public Map<String, Object> lag() throws Exception {
+        // 1. 取 group's committed offsets
+        var groupOffsets = adminClient
+            .listConsumerGroupOffsets(GROUP)
+            .partitionsToOffsetAndMetadata()
+            .get();
+
+        // 2. 取 each partition 嘅 log end offset
+        var partitions = groupOffsets.keySet();
+        var endOffsets = consumer.endOffsets(partitions);
+
+        // 3. compute lag per partition
+        List<Map<String, Object>> partitionLag = partitions.stream().map(tp -> {
+            long committed = groupOffsets.get(tp).offset();
+            long latest = endOffsets.get(tp);
+            return Map.<String, Object>of(
+                "partition", tp.partition(),
+                "committed", committed,
+                "latest", latest,
+                "lag", latest - committed
+            );
+        }).toList();
+
+        long totalLag = partitionLag.stream()
+            .mapToLong(m -> (Long) m.get("lag")).sum();
+
+        return Map.of("group", GROUP, "topic", TOPIC,
+                      "totalLag", totalLag, "partitions", partitionLag);
+    }
+}
+```
+
+#### Threshold — unit choice 係 senior signal
+
+**Junior**: `lag > 10000 alert`  
+**Senior**: `lag > 5 minutes worth alert`
+
+點解？看 traffic-dependent scenarios：
+
+| Scenario | lag_msgs | rate | lag_seconds |
+|---|---|---|---|
+| Quiet night | 5,000 | 5 msg/s | **1000s = 16 min ⚠️** |
+| Black Friday peak | 50,000 | 10,000 msg/s | **5s — fine** |
+
+Threshold 寫 "lag > 10,000" → quiet night case 唔 alert (實際出事)，Black Friday 狂 alert (其實正常)。**完全反轉。**
+
+PromQL formula:
+
+```promql
+(kafka_consumer_records_lag / 
+ rate(kafka_consumer_records_consumed_total[5m])) > 300
+```
+
+意思 = "以現時 rate consume 要 > 5 分鐘"。`for 5m` 條件兜底瞬間 spike：
+
+```yaml
+- alert: KafkaConsumerLagHigh
+  expr: (kafka_consumer_records_lag / 
+         rate(kafka_consumer_records_consumed_total[5m])) > 300
+  for: 5m
+  labels:
+    severity: page
+    pagerduty: oncall
+  annotations:
+    summary: "inventory-service lag > 5min worth on {{ $labels.partition }}"
+```
+
+#### False positive scenarios
+
+| Scenario | Why lag spike | Mitigation |
+|---|---|---|
+| Deployment rolling restart | Consumer 落 service 30s | `for 5m` 條件 filter |
+| Consumer rebalance | 新 instance join，partition reassignment | Same |
+| Manual offset reset | Operational replay (你 L6 demo 嗰 case) | 提前 silence alert |
+| Cold start post-maintenance | Service 落咗一晚朝早起返 | Snooze 30 min |
+| Bursty design workload | Marketing push、batch ETL | Threshold align expected peak |
+
+#### Burrow's "consumer status" classification (advanced)
+
+LinkedIn Burrow 唔淨係 expose lag number，仲 classify consumer state：
+
+| Status | 意思 |
+|---|---|
+| `OK` | Lag 細 + 仍然 consume |
+| `WARNING` | Lag 大但仍然 consume — backlog 緊但唔死 |
+| `ERROR` | Lag 大 + offset **stalled** (committed offset 唔郁) — consumer 死咗 / stuck |
+| `STOP` | Consumer group 完全冇 heartbeat — process crash |
+
+**Key insight：** 淨係 lag number 唔夠，要睇 **"offset 仲有冇 advance"**。Lag 100k + offset 每秒 +1000 = 緊張但 recovering；Lag 100k + offset 5 分鐘冇郁 = consumer process 死咗 / poison message stuck。呢個 distinction 就係 L6 war story #3 嘅 detection signal。
+
+---
+
+### Q5 — KRaft Mode Migration
+
+#### Core mechanism
+
+**ZooKeeper era：** Kafka broker 將所有 metadata (broker list、topic config、partition assignment、ACL、controller election) 存喺 external ZK cluster。Broker 每個 metadata 操作要 round-trip ZK — extra hop + extra failure mode。
+
+**KRaft era：** Kafka 用自己嘅 commit log abstraction，所有 metadata 收落內部 topic `__cluster_metadata`，3-5 個 controller node 用 Raft consensus 保持同步：
+
+```
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Controller 1 │  │ Controller 2 │  │ Controller 3 │  ← Raft quorum
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       └─────────────────┼─────────────────┘
+                         ▼
+            __cluster_metadata topic
+            (internal, Raft-replicated)
+```
+
+Kafka eat its own dog food — metadata 變成 Kafka topic。Bootstrap 時間由數十秒 → 數秒；partition scale ceiling 由 ~200k → millions。
+
+#### Migration — Bridge Release Path
+
+由 Kafka 3.4 開始 support：
+
+```
+Step 1: 升級 Kafka 到 bridge release (3.5+)
+        — 仍然 ZK mode，但 binary 識 KRaft
+
+Step 2: kafka-storage format — 為新 KRaft controller 準備 metadata storage
+        kafka-storage format -t <cluster-id> -c config/kraft/controller.properties
+
+Step 3: 部署新 KRaft controller quorum (3 個新 node)
+        — ZK 仲跑緊，新 controller 喺 "migration mode"
+
+Step 4: Migration 觸發
+        — ZooKeeperToKRaftMigrator snapshot ZK 全部 metadata
+        — Replay 入 __cluster_metadata topic
+        — Dual write 模式: metadata write 同時 ZK + KRaft
+
+Step 5: Cutover — broker rolling restart
+        — Broker 1 restart with KRaft config (controller.quorum.voters=...)
+        — Verify cluster healthy
+        — Broker 2, 3 逐個 rolling
+        — Controller authority 由 ZK 切去 KRaft
+
+Step 6: Decommission ZooKeeper
+        — 確認穩定運行 1-2 週
+        — 移除 zookeeper.connect config
+        — 關 ZK cluster
+        — 留 ZK data dir 6 個月做 forensic
+```
+
+**呢個 4-5 步 pattern 同 Strangler Fig migration 一樣**：
+- L4 user 表 migration: dual-write monolith DB + new DB → cutover → decommission
+- KRaft migration: dual-write ZK + KRaft → cutover → decommission
+
+**Same playbook, different domain.** 任何 stateful infrastructure migration 都係呢個 shape — senior transferable mental model。
+
+#### Risk + Rollback
+
+**Hard constraint：** Apache 官方 stated "KRaft migration is currently a one-way migration"。一旦 Step 5 cutover 完成，**rollback 唔再 trivial**。
+
+| Phase | Reversibility | Hedge |
+|---|---|---|
+| Step 1-3 | ✅ 易 — 仲未 dual-write | Rollback = 拆 KRaft controller |
+| Step 4 (dual-write) | ✅ 易 — ZK 仍係 source of truth | 隨時停 migration |
+| Step 5 (cutover) | ⚠️ **Hard** — Authority 已轉去 KRaft | Pre-cutover metadata diff 100% match 先 proceed |
+| Step 6 (decommission) | ❌ 唔可逆 | 留 ZK data 6 個月 forensic |
+
+**Production playbook：**
+
+1. **Staging cluster migrate 先**，跑足 2 週，production traffic mirror 過去
+2. **Cutover 揀低峰時段** — 凌晨 3am
+3. **Pre-cutover diff check** — write script 對比 ZK ↔ KRaft metadata，100% match 先 proceed
+4. **保留 ZK cluster 至少 1 個月** — config 移除咗但 VM/data 唔好殺
+5. **Rollback decision tree** — pre-cutover: rollback OK；post-cutover: **forward fix only**
+
+**Quorum failure recovery：** Mid-migration KRaft controller quorum lost majority (3 個 controller 死晒 2 個) → Step 4 dual-write 期間，**broker 仍然可以 read from ZK 繼續 serve traffic** — degraded mode but not down。Restore controller node → quorum 自動 recover → resume migration。
+
+#### Quorum sizing
+
+```
+Quorum size needed for write = floor(N/2) + 1
+```
+
+| Controller 數 | Majority | 容忍失敗 |
+|---|---|---|
+| 1 | 1 | 0 — 無 HA |
+| **2** | **2** | **0 — 任一死全 stuck** ❌ |
+| **3** | 2 | 1 — sweet spot ⭐ |
+| **4** | 3 | 1 — 同 3 個容錯一樣，但成本 33% 多 ❌ |
+| **5** | 3 | 2 — 高可用 production |
+| 7 | 4 | 3 — overkill |
+
+**Why even 數量陷阱？** 2 個 controller，majority = 2，任一死 → 剩 1 唔達 quorum → cluster frozen。**2 個 controller 嘅 fault tolerance 反而 worse than 1 個** — 失敗概率 2× 但容錯仍 0。永遠揀奇數 (3 或 5)。
+
+**Why 唔建議 7？**
+- Majority quorum 變 4 → 每 metadata write 要 4 個 ack → latency ↑
+- ROI 遞減：3→5 大幅提升 fault tolerance，5→7 邊際收益細
+- Cost 33% 多但 benefit 細，大部分 production cluster 揀 5 個夠用
+
+**唯一用 7 個嘅 case**：跨 7 AZ 嘅 ultra-HA 部署 (金融 / 政府 critical infra)，但呢類 case 通常另外 architecture。
+
+---
+
+#### 🎯 Synthesis — Q1-Q5 之間嘅 link
+
+| Question | Connects to L6 codebase |
+|---|---|
+| Q1 (DLQ) | 解決 war story #3 (duplicate replay infinite loop) 嘅 **containment** 層 |
+| Q2 (`@EmbeddedKafka` + Awaitility) | 補完 L6 unit test gap — 真正 verify end-to-end wiring |
+| Q3 (Schema versioning) | `@JsonIgnoreProperties(ignoreUnknown = true)` 嘅 long-term 應用 strategy |
+| Q4 (Lag monitoring) | War story #3 嘅 **detection** 層 — 唔靠人手 grep log，靠 alert |
+| Q5 (KRaft migration) | 解釋點解 L6 揀 ZK + 將來無可避免要 migrate |
+
+呢 5 條題目連起嚟 = **「production-grade event-driven system 由 dev → production」嘅 full operational checklist**。L6 codebase 只係實現咗 happy path + 1 層 idempotency，呢 5 條題目嘅答案就係剩低 80% 嘅 production hardening。
+
+</details>
+
 ---
 
 ## 14. Next Lesson Preview — Lesson 07
