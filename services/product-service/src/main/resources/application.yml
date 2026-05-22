@@ -49,6 +49,12 @@ spring:
         delivery.timeout.ms: 10000               # 整個 send 操作 timeout
         request.timeout.ms: 5000                 # 單次 broker request timeout
 
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${JWT_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+
 
 # ===== Server =====
 server:
