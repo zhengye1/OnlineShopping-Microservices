@@ -42,7 +42,11 @@ spring:
     listener:
       ack-mode: MANUAL_IMMEDIATE
       missing-topics-fatal: false
-
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${JWT_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
 server:
   port: 8083
 

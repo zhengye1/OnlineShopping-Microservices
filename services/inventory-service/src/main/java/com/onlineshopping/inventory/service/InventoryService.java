@@ -1,5 +1,6 @@
 package com.onlineshopping.inventory.service;
 
+import com.onlineshopping.inventory.dto.InventoryResponse;
 import com.onlineshopping.inventory.entity.Inventory;
 import com.onlineshopping.inventory.entity.ProcessedEvent;
 import com.onlineshopping.inventory.event.ProductCreatedEvent;
@@ -9,6 +10,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Optional;
 
 /**
  * Inventory business logic — driven by cross-service events.
@@ -61,4 +64,11 @@ public class InventoryService {
         processedEventRepo.save(dedup);
         log.debug("Dedup record committed: eventId={}", event.eventId());
     }
+
+    @Transactional(readOnly = true)
+    public Optional<InventoryResponse> getStock(Long productId) {
+        return inventoryRepo.findById(productId)
+                .map(inv -> new InventoryResponse(inv.getProductId(), inv.getStockQuantity()));
+    }
+
 }
