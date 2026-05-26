@@ -10,7 +10,10 @@ import org.springframework.cloud.openfeign.EnableFeignClients;
  * <p>{@code @EnableFeignClients} scans for {@code @FeignClient} interfaces
  * (ProductClient, InventoryClient) and generates HTTP-calling proxies.
  */
-@SpringBootApplication
+@SpringBootApplication(scanBasePackages = {
+        "com.onlineshopping.cart",
+        "com.onlineshopping.common.web"
+})
 @EnableFeignClients
 public class CartServiceApplication {
 

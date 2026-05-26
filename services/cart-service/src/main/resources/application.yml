@@ -40,6 +40,9 @@ spring:
       resourceserver:
         jwt:
           jwk-set-uri: ${JWT_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+  output:
+    ansi:
+      enabled: always
 
 # ===== Server =====
 server:
@@ -50,6 +53,9 @@ server:
 
 # ===== Logging =====
 logging:
+  pattern:
+    console: "%clr(%d{HH:mm:ss.SSS}){faint} %clr([%X{correlationId:-no-cid}]){magenta} %clr(%-5level)
+  %clr(%logger{36}){cyan} - %msg%n"
   level:
     com.onlineshopping: DEBUG
     org.springframework.security: INFO

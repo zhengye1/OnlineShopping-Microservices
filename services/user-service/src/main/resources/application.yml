@@ -35,7 +35,9 @@ spring:
     baseline-on-migrate: true
     locations: classpath:db/migration
     validate-on-migrate: true
-
+  output:
+    ansi:
+      enabled: always
 
 # ===== Server =====
 server:
@@ -55,6 +57,9 @@ app:
 
 # ===== Logging =====
 logging:
+  pattern:
+    console: "%clr(%d{HH:mm:ss.SSS}){faint} %clr([%X{correlationId:-no-cid}]){magenta} %clr(%-5level)
+  %clr(%logger{36}){cyan} - %msg%n"
   level:
     com.onlineshopping: DEBUG
     org.springframework.security: INFO

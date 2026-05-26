@@ -98,7 +98,10 @@
             <groupId>com.onlineshopping</groupId>
             <artifactId>common-events</artifactId>
         </dependency>
-
+        <dependency>
+            <groupId>com.onlineshopping</groupId>
+            <artifactId>common-web</artifactId>
+        </dependency>
         <!-- ===== Test scope ===== -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

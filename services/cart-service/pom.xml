@@ -87,6 +87,10 @@
             <optional>true</optional>
         </dependency>
 
+        <dependency>
+            <groupId>com.onlineshopping</groupId>
+            <artifactId>common-web</artifactId>
+        </dependency>
         <!-- Tests -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
