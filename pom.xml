@@ -29,6 +29,7 @@
     <modules>
         <module>shared/common-events</module>
         <module>shared/common-dto</module>
+        <module>shared/common-web</module>
         <module>services/user-service</module>
         <module>services/product-service</module>
         <module>services/inventory-service</module>
@@ -56,6 +57,11 @@
             <dependency>
                 <groupId>${project.groupId}</groupId>
                 <artifactId>common-dto</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>common-web</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>
