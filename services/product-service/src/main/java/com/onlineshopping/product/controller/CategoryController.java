@@ -7,7 +7,6 @@ import com.onlineshopping.product.dto.ProductResponse;
 import com.onlineshopping.product.entity.Category;
 import com.onlineshopping.product.entity.Product;
 import com.onlineshopping.product.service.CategoryService;
-import jakarta.annotation.Resource;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
@@ -15,7 +14,7 @@ import org.springframework.web.bind.annotation.*;
 @RestController
 @RequestMapping("/categories")
 public class CategoryController {
-    @Resource
+
     private final CategoryService categoryService;
 
     public CategoryController(CategoryService categoryService){

@@ -42,11 +42,22 @@ spring:
     listener:
       ack-mode: MANUAL_IMMEDIATE
       missing-topics-fatal: false
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${JWT_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+  output:
+    ansi:
+      enabled: always
 
 server:
   port: 8083
 
 logging:
+  pattern:
+    console: "%clr(%d{HH:mm:ss.SSS}){faint} %clr([%X{correlationId:-no-cid}]){magenta} %clr(%-5level)
+  %clr(%logger{36}){cyan} - %msg%n"
   level:
     com.onlineshopping: DEBUG
     org.hibernate.SQL: INFO

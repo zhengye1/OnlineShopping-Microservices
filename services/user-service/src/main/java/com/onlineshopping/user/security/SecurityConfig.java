@@ -40,6 +40,7 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        //@formatter:off
         return http.csrf(AbstractHttpConfigurer::disable)
                 .exceptionHandling(
                         eh ->
@@ -49,13 +50,17 @@ public class SecurityConfig {
                 .sessionManagement(s ->
                         s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth ->
-                        auth.requestMatchers("/auth/**", "/health", "/actuator/**", "/error")
+                        auth.requestMatchers("/auth/**",
+                                        "/health",
+                                        "/actuator/**",
+                                        "/error",
+                                        "/.well-known/jwks.json")
                         .permitAll()
                         .anyRequest()
                         .authenticated())
                 .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)
-
                 .build();
+        //@formatter:on
     }
 
     @Bean

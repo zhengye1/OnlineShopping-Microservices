@@ -1,5 +1,6 @@
 package com.onlineshopping.inventory.service;
 
+import com.onlineshopping.inventory.dto.InventoryResponse;
 import com.onlineshopping.inventory.entity.Inventory;
 import com.onlineshopping.inventory.entity.ProcessedEvent;
 import com.onlineshopping.inventory.event.ProductCreatedEvent;
@@ -9,6 +10,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Optional;
 
 /**
  * Inventory business logic — driven by cross-service events.
@@ -46,12 +49,14 @@ public class InventoryService {
             log.info("Inventory row already exists for productId={} — recording dedup only " +
                     "(likely offset reset replay)", event.productId());
         } else {
+            int initialStock = event.initialStock() != null ? event.initialStock() : 0;
             Inventory inv = Inventory.builder()
                     .productId(event.productId())
-                    .stockQuantity(0)
+                    .stockQuantity(initialStock)
                     .build();
             inventoryRepo.save(inv);
-            log.info("Inventory initialised: productId={} sku={}", event.productId(), event.sku());
+            log.info("Inventory initialised: productId={} sku={} stock={}",
+                    event.productId(), event.sku(), initialStock);
         }
 
         ProcessedEvent dedup = ProcessedEvent.builder()
@@ -61,4 +66,11 @@ public class InventoryService {
         processedEventRepo.save(dedup);
         log.debug("Dedup record committed: eventId={}", event.eventId());
     }
+
+    @Transactional(readOnly = true)
+    public Optional<InventoryResponse> getStock(Long productId) {
+        return inventoryRepo.findById(productId)
+                .map(inv -> new InventoryResponse(inv.getProductId(), inv.getStockQuantity()));
+    }
+
 }

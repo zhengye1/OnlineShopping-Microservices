@@ -4,16 +4,14 @@ import com.onlineshopping.product.dto.CreateCategoryRequest;
 import com.onlineshopping.product.entity.Category;
 import com.onlineshopping.product.repository.CategoryRepository;
 import com.onlineshopping.product.snowflake.SnowflakeIdGenerator;
-import jakarta.annotation.Resource;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class CategoryService {
-    @Resource
+
     private final CategoryRepository categoryRepository;
 
-    @Resource
     private final SnowflakeIdGenerator snowflake;
 
     public CategoryService(CategoryRepository categoryRepository,

@@ -28,6 +28,7 @@ public class Category {
     private Long parentId;                 // ← Long, NOT @ManyToOne self-reference
 
     @Column(name = "sort_order", nullable = false)
+    @Builder.Default
     private Integer sortOrder = 0;
 
     // + created_at, updated_at, deleted_at, version (mirror Product)

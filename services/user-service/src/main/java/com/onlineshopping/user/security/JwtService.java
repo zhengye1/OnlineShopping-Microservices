@@ -5,19 +5,32 @@ import com.onlineshopping.user.entity.User;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
+import jakarta.annotation.PostConstruct;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.converter.RsaKeyConverters;
 import org.springframework.stereotype.Service;
 
-import javax.crypto.SecretKey;
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
+import java.io.InputStream;
+import java.security.interfaces.RSAPrivateKey;
+import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
 
 /**
- * JWT token issuance + verification (HS256).
+ * JWT token issuance + verification (RS256 asymmetric).
+ *
+ * <p>L7 migration: HS256 shared-secret → RS256 public/private key pair.
+ * Private key signs locally (NEVER leaves user-service); public key is shipped
+ * via {@code /.well-known/jwks.json} so cross-service consumers (cart / product
+ * / inventory) can verify tokens with zero round-trip back to user-service.
+ *
+ * <p>Token header carries {@code kid} matching {@link JwtProperties#getKeyId()}
+ * — enables zero-downtime key rotation: publish new {@code kid} in JWKS, sign
+ * new tokens with new key, old tokens still verify via cached old key until TTL.
  *
  * <p>Token claim shape:
  * <ul>
@@ -27,10 +40,6 @@ import java.util.Date;
  *   <li>{@code exp}  — expiration (UTC epoch seconds)
  *   <li>{@code role} — RBAC role string ({@link Role#name()})
  * </ul>
- *
- * <p>L4 uses HS256 (symmetric) for course MVP simplicity.
- * Production grade (L18+) — switch to RS256 (asymmetric) so each microservice
- * holds only the public key for verification; private key stays in user-service.
  */
 @Service
 @RequiredArgsConstructor
@@ -41,18 +50,38 @@ public class JwtService {
 
     private final JwtProperties props;
 
+    private RSAPrivateKey privateKey;
+
+    @Getter
+    private RSAPublicKey publicKey;
+
+    @PostConstruct
+    public void loadKeys() {
+        try (InputStream in = props.getPrivateKey().getInputStream()) {
+            this.privateKey = RsaKeyConverters.pkcs8().convert(in);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to load JWT private key from " + props.getPrivateKey(), e);
+        }
+        try (InputStream in = props.getPublicKey().getInputStream()) {
+            this.publicKey = RsaKeyConverters.x509().convert(in);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to load JWT public key from " + props.getPublicKey(), e);
+        }
+    }
+
     /** Issue a signed JWT for the given user. Called from login + register flows. */
     public String issueToken(User user) {
         Instant now = Instant.now();
         Instant exp = now.plus(props.getExpirationMinutes(), ChronoUnit.MINUTES);
 
         return Jwts.builder()
+                .header().keyId(props.getKeyId()).and()
                 .subject(user.getId().toString())
                 .issuer(props.getIssuer())
                 .issuedAt(Date.from(now))
                 .expiration(Date.from(exp))
                 .claim(CLAIM_ROLE, user.getRole().name())
-                .signWith(signingKey())
+                .signWith(privateKey, Jwts.SIG.RS256)
                 .compact();
     }
 
@@ -63,7 +92,7 @@ public class JwtService {
     public Claims parseClaims(String token) {
         try {
             return Jwts.parser()
-                    .verifyWith(signingKey())
+                    .verifyWith(publicKey)
                     .requireIssuer(props.getIssuer())
                     .build()
                     .parseSignedClaims(token)
@@ -84,7 +113,7 @@ public class JwtService {
         return Role.valueOf(parseClaims(token).get(CLAIM_ROLE, String.class));
     }
 
-    private SecretKey signingKey() {
-        return Keys.hmacShaKeyFor(props.getSecret().getBytes(StandardCharsets.UTF_8));
+    public String getKeyId() {
+        return props.getKeyId();
     }
 }
