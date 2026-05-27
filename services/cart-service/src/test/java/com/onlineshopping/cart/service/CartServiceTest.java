@@ -141,8 +141,9 @@ class CartServiceTest {
         when(cartItemRepo.findById(new CartItemId(USER_ID, PRODUCT_ID))).thenReturn(Optional.of(existing));
 
         assertThatThrownBy(() ->cartService.addItem(USER_ID, req))
-                .isInstanceOf(ResponseStatusException.class)
-                .hasMessageContaining("409");
+                .satisfies(e -> assertThat(((ResponseStatusException) e).getStatusCode())
+                        .isEqualTo(HttpStatus.CONFLICT))
+                .isInstanceOf(ResponseStatusException.class);
         verify(cartItemRepo, never()).save(any());
 
     }
@@ -152,8 +153,9 @@ class CartServiceTest {
         when(productClient.findById(any())).thenThrow(notFound("/products/100"));
         AddCartItemRequest req = new AddCartItemRequest(PRODUCT_ID, 10);
         assertThatThrownBy(() ->cartService.addItem(USER_ID, req))
-                .isInstanceOf(ResponseStatusException.class)
-                .hasMessageContaining("404");
+                .satisfies(e -> assertThat(((ResponseStatusException) e).getStatusCode())
+                        .isEqualTo(HttpStatus.NOT_FOUND))
+                .isInstanceOf(ResponseStatusException.class);
         verify(inventoryClient, never()).getStock(any());   // 證明 short-circuit
         verify(cartItemRepo, never()).save(any());
     }
@@ -164,8 +166,9 @@ class CartServiceTest {
         when(productClient.findById(PRODUCT_ID)).thenReturn(sampleProduct());
         when(inventoryClient.getStock(any())).thenThrow(notFound("/inventory/100"));
         assertThatThrownBy(() ->cartService.addItem(USER_ID, req))
-                .isInstanceOf(ResponseStatusException.class)
-                .hasMessageContaining("404");
+                .satisfies(e -> assertThat(((ResponseStatusException) e).getStatusCode())
+                        .isEqualTo(HttpStatus.NOT_FOUND))
+                .isInstanceOf(ResponseStatusException.class);
         verify(cartItemRepo, never()).save(any());
     }
 }
