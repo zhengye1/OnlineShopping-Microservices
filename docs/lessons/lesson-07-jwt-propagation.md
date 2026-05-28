@@ -1094,6 +1094,648 @@ Zero downtime + zero forced re-login。
    (c) Backward compat — dual-emit both headers during transition
    (d) Sampling strategy (1% production traffic vs full dev)
 
+<details>
+<summary><strong>📖 Polished Solutions (L8 session fold-back)</strong></summary>
+
+> 小V 嘅 cold-attempt notes (final score 26/180 = 14%):
+> - **Q1 (18/40)**: Dual-token pattern + `httpOnly` refresh cookie 答到核心，但 Redis 角色撈亂 — 將「無痛 login」歸功畀 Redis，其實無痛純粹係 access/refresh 雙 token 機制嘅 happy path，根本唔需要 Redis。Redis 真正角色係 **revocation blocklist**。
+> - **Q2 (8/30)**: 識方向 (`AbstractIntegrationTest` base class + `@AuthenticationPrincipal Jwt` 係 blocker)，但唔識點 unblock — 缺 `SecurityMockMvcRequestPostProcessors.jwt()` / `@MockBean JwtDecoder` 呢類 Spring test idiom。
+> - **Q3 / Q4 / Q5 (0/110)**: Cold surrender — service mesh、reservation race conditions、OpenTelemetry W3C tracecontext 全部係 staff-level distributed systems topic，未做過 production migration 自然 cold。
+> - 整體比 L6 (35/170 = 20%) 略低，但 L7 hw 套題全部係未掂過嘅 senior topic，正常 baseline。
+
+---
+
+### Q1 — JWT Refresh Token + Redis Revocation Blocklist
+
+**核心 mental model：** 「無痛 login」同「revocation」係兩條獨立 axis，唔好撈埋。
+
+```
+無痛 login          ← 純粹 dual-token (access TTL=15min + refresh TTL=7-30day) 嘅自然結果
+                     access 即將過期 → frontend interceptor 自動 call /auth/refresh
+                     完全唔需要 Redis
+
+Revocation         ← JWT 嘅原罪：stateless + 簽出去就 valid until expiry
+                     要即時 invalidate (logout / 密碼改 / 帳號被盜) 必須中央 state
+                     呢度先至需要 Redis
+```
+
+#### Dual-token issue flow
+
+```java
+// POST /auth/login
+public LoginResponse login(LoginRequest req) {
+    User u = authenticate(req);
+    return new LoginResponse(
+        jwtService.issueAccessToken(u, Duration.ofMinutes(15)),
+        jwtService.issueRefreshToken(u, Duration.ofDays(30))  // 存 DB / Redis with jti
+    );
+}
+
+// POST /auth/refresh — 重點：rotation
+public RefreshResponse refresh(@CookieValue String refreshToken) {
+    Claims claims = jwtService.parseAndVerify(refreshToken);  // 1. 驗 signature
+    String oldJti = claims.get("jti", String.class);
+
+    if (revokedRefreshTokens.exists(oldJti)) {                // 2. blocklist check
+        revokeAllForUser(claims.getSubject());                // 偵測到盜用 → kill all sessions
+        throw new TokenReuseException();
+    }
+
+    revokedRefreshTokens.add(oldJti, claims.getExpiration()); // 3. 舊 refresh 即時 invalidate
+    return new RefreshResponse(
+        jwtService.issueAccessToken(claims.getSubject(), Duration.ofMinutes(15)),
+        jwtService.issueRefreshToken(claims.getSubject(), Duration.ofDays(30))  // 4. 新 refresh
+    );
+}
+```
+
+`POST /auth/refresh` 嘅 contract：**畀我舊 refresh，我畀你新 access + 新 refresh，舊 refresh 即時失效** — 即所謂 **refresh token rotation** (OAuth 2.1 推薦 + Auto0/Okta default)。如果有人偷咗你 refresh token 用咗一次，你下次用就會撞 blocklist → 即時偵測到盜用。
+
+#### Refresh token storage trade-off
+
+| 存放位置 | XSS 抗性 | CSRF 抗性 | 重啟存活 | 跨 subdomain |
+|---|---|---|---|---|
+| **`httpOnly` cookie** ⭐ | ✅ JS 讀唔到 | ❌ 需要 SameSite + CSRF token | ✅ | ✅ same eTLD+1 |
+| `localStorage` | ❌ 任何 XSS payload 偷得到 | ✅ 唔會自動帶 | ✅ | ❌ same origin only |
+| `sessionStorage` | ❌ | ✅ | ❌ tab close 就冇 | ❌ |
+| Memory (JS variable) | ⚠️ 仍受 XSS 影響但 window 細 | ✅ | ❌ refresh page 就冇 | ❌ |
+
+**Production default：refresh token 入 `httpOnly` + `Secure` + `SameSite=Strict` cookie，access token 入 memory。** 呢個 combo 既防 XSS 偷 refresh，又靠 SameSite 防 CSRF，access token 喺 memory 即使俾 XSS 偷都好快過期。
+
+#### Redis blocklist 結構
+
+```redis
+# Logout / refresh rotation 後：
+SET blocklist:refresh:{jti} "1" EX {remaining_seconds}
+SET blocklist:access:{jti}  "1" EX {remaining_seconds}
+
+# Per-user "kill all sessions" (改密碼 / admin force-logout):
+SET user:revoke-before:{userId} {timestamp_now} EX {max_refresh_ttl}
+
+# Resource server validation (每個 request):
+1. Verify signature locally via JWKS                    ← 99% 流量止於此
+2. Read JWT iat claim
+3. GET user:revoke-before:{sub} → 如果 iat < revoke-before → reject
+4. GET blocklist:access:{jti} → 如果存在 → reject
+```
+
+`user:revoke-before:{userId}` 嘅 timestamp 技巧避免 enumeration 攻擊：唔需要 list 所有 active jti，只需要存一個「呢個 user 喺呢個時間之後簽出嘅 token 先有效」嘅 cutoff。
+
+#### Failure modes
+
+| 場景 | 後果 | 解 |
+|---|---|---|
+| Redis 死 + fail-closed | 全 stack auth 100% 不可用 | Circuit breaker → 短暫 fail-open + alert |
+| Redis 死 + fail-open | 短暫 revocation window 失效 | 風險可接受 (短期 SLO) — 多數選呢個 |
+| Clock skew → iat > revoke-before 但實際過期 | False negative (rare) | NTP 同步 + tolerance window (e.g. 60s) |
+| Refresh rotation race (同時 2 個 device) | 2 個 device 互相 logout | 容忍 + 提供 reauth UX |
+
+#### 🎯 面試金句
+
+> "Stateless JWT is great until you need revocation. We solved the layering by keeping signature verification stateless via JWKS — 99% of requests don't hit Redis — and only consulting a Redis blocklist for the small subset that need real-time invalidation (logout, password change, compromised token). The seamless login experience is unrelated; that's just the dual access/refresh token pattern with frontend retry on 401."
+
+---
+
+### Q2 — `@SpringBootTest` Integration Test for Multi-Service Chain
+
+**Layering 原則：integration test ≠ e2e test。**
+
+- **Unit test** (你 L7 已寫嘅 `CartServiceTest`)：mock 晒所有 dependency，focus 單一 method
+- **Integration test** (呢條 hw)：**真 DB (Testcontainers) + mock HTTP (WireMock) + 真 Security stack**，focus single service 嘅完整 stack
+- **E2E test** (L23 + load test)：4 service 全部真實 spin up，focus 跨 service flow
+
+呢條 hw 屬於中間層 — 你 cart-service 嘅 Controller → Security → Service → JPA → DB **全部走真嘅**，淨係下游 product/inventory HTTP call 用 WireMock stub。
+
+#### `AbstractIntegrationTest` base class
+
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@AutoConfigureMockMvc
+@Testcontainers
+@ActiveProfiles("test")
+public abstract class AbstractIntegrationTest {
+
+    @Container
+    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.4")
+        .withDatabaseName("cart_service_db")
+        .withUsername("cart")
+        .withPassword("cart");
+
+    static WireMockServer wireMock = new WireMockServer(
+        WireMockConfiguration.options().dynamicPort()
+    );
+
+    @BeforeAll
+    static void startWireMock() {
+        wireMock.start();
+    }
+
+    @AfterAll
+    static void stopWireMock() {
+        wireMock.stop();
+    }
+
+    @AfterEach
+    void resetWireMock() {
+        wireMock.resetAll();
+    }
+
+    @DynamicPropertySource
+    static void registerProps(DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url", mysql::getJdbcUrl);
+        r.add("spring.datasource.username", mysql::getUsername);
+        r.add("spring.datasource.password", mysql::getPassword);
+        r.add("app.product-service.base-url", wireMock::baseUrl);
+        r.add("app.inventory-service.base-url", wireMock::baseUrl);
+    }
+
+    @Autowired
+    protected MockMvc mockMvc;
+
+    @Autowired
+    protected ObjectMapper objectMapper;
+}
+```
+
+**重點 design**：
+- `@Container` + `@DynamicPropertySource` 將 MySQL JDBC URL 動態注入 Spring properties → 真 MySQL，唔係 H2
+- 同一個 WireMock instance 蒙混 product + inventory 兩個 downstream — `app.*.base-url` 指晒去 WireMock，靠不同 path 區分
+
+#### 解 `@AuthenticationPrincipal Jwt` blocker — 3 方案
+
+**方案 A — `SecurityMockMvcRequestPostProcessors.jwt()` (推薦)**
+
+```java
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
+
+mockMvc.perform(post("/cart/items")
+    .with(jwt().jwt(j -> j
+        .subject("42")
+        .claim("role", "USER")
+        .claim("jti", UUID.randomUUID().toString())))
+    .contentType(MediaType.APPLICATION_JSON)
+    .content(objectMapper.writeValueAsString(req)))
+.andExpect(status().isCreated());
+```
+
+`jwt()` post-processor 直接 inject 一個 `JwtAuthenticationToken` 入 Security context — `@AuthenticationPrincipal Jwt` 一拎就拎到。**唔需要碰 JwtDecoder。**
+
+**方案 B — `@MockBean JwtDecoder`**
+
+```java
+@MockBean
+private JwtDecoder jwtDecoder;
+
+@BeforeEach
+void stubDecoder() {
+    Jwt fake = Jwt.withTokenValue("fake")
+        .header("alg", "RS256")
+        .claim("sub", "42")
+        .claim("role", "USER")
+        .build();
+    when(jwtDecoder.decode(anyString())).thenReturn(fake);
+}
+```
+
+Test 嗰時帶 `Authorization: Bearer fake`，Spring oauth2-resource-server 行去 `JwtDecoder.decode()` 撞到 mock 直接返 fake Jwt。比 A 重 setup 但更 production-like (full filter chain 行咗一次)。
+
+**方案 C — Mint real JWT with test keypair**
+
+```yaml
+# application-test.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          public-key-location: classpath:test-keys/jwt-public-test.pem
+```
+
+```java
+private String mintTestJwt(Long userId, String role) {
+    return Jwts.builder()
+        .subject(userId.toString())
+        .claim("role", role)
+        .header().keyId("test-key").and()
+        .signWith(TEST_PRIVATE_KEY, Jwts.SIG.RS256)
+        .expiration(Date.from(Instant.now().plus(Duration.ofMinutes(5))))
+        .compact();
+}
+```
+
+最貼近 prod，但要管理 test 用嘅 PEM file。Trade-off — security regression test (e.g. 過期 token / 錯 issuer) 必須行 C 先 catch 到。
+
+#### Test scenarios per requirement
+
+```java
+class AddCartItemIntegrationTest extends AbstractIntegrationTest {
+
+    @Test
+    void happyPath_productOk_stockOk_returns201() throws Exception {
+        wireMock.stubFor(get(urlPathEqualTo("/products/100"))
+            .willReturn(okJson("""
+                {"id":100,"name":"Mac","sku":"M1","priceCents":129900,
+                 "currency":"CAD","status":"ACTIVE"}""")));
+        wireMock.stubFor(get(urlPathEqualTo("/inventory/100"))
+            .willReturn(okJson("""
+                {"productId":100,"stockQuantity":50}""")));
+
+        mockMvc.perform(post("/cart/items")
+            .with(jwt().jwt(j -> j.subject("42")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""{"productId":100,"quantity":2}"""))
+        .andExpect(status().isCreated())
+        .andExpect(jsonPath("$.productId").value(100))
+        .andExpect(jsonPath("$.quantity").value(2));
+
+        wireMock.verify(getRequestedFor(urlPathEqualTo("/products/100"))
+            .withHeader("Authorization", matching("Bearer .+")));
+    }
+
+    @Test
+    void productNotFound_returns404() throws Exception {
+        wireMock.stubFor(get(urlPathEqualTo("/products/999"))
+            .willReturn(notFound()));
+
+        mockMvc.perform(post("/cart/items")
+            .with(jwt().jwt(j -> j.subject("42")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""{"productId":999,"quantity":1}"""))
+        .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void insufficientStock_returns409() throws Exception { /* ... */ }
+    void unauthenticated_returns401() throws Exception { /* sans .with(jwt()) */ }
+}
+```
+
+#### 🎯 面試金句
+
+> "We mock the HTTP transport (WireMock) but use real DB (Testcontainers) and full Spring Security filter chain. The trap is `@AuthenticationPrincipal Jwt` — `@WithMockUser` won't work because it produces a `UsernamePasswordAuthenticationToken`, not a `Jwt`. The clean fix is `SecurityMockMvcRequestPostProcessors.jwt()` which injects a fake `JwtAuthenticationToken` directly. For tests that need to validate the resource-server filter chain itself, we mint a real JWT with a test keypair and configure the test profile to trust that key."
+
+---
+
+### Q3 — Service Mesh (Istio + mTLS) — `FeignAuthForwardInterceptor` Retirement?
+
+**核心：mTLS 同 JWT 係唔同層嘅 auth — 唔可以互相取代。**
+
+```
+mTLS    → service identity      "邊個 service 打嚟"
+JWT     → user identity         "邊個用戶打嚟"
+```
+
+如果你 100% trust mTLS，會錯誤推論「sidecar 已經 verify 咗 caller 係 cart-svc → 唔需要 JWT」— 呢個推論成立**僅當你嘅 product-svc 對所有 cart-svc 嘅 user 一視同仁**。但實際上你 product POST 要 check `ROLE_SELLER`，inventory `DELETE` 要 check `ROLE_ADMIN` — 呢啲決定全部 base on **user role**，唔係 service identity。所以 JWT 仍然必須 propagate。
+
+#### Layered responsibility 重新劃分
+
+| 任務 | Without mesh (L7) | With Istio mesh |
+|---|---|---|
+| **Transport encryption** | App-level TLS or none | mTLS automatic (sidecar handle handshake) |
+| **Caller service identity** | None | SPIFFE/SPIRE cert (sidecar auto-attach) |
+| **JWT signature verification** | `oauth2-resource-server` starter per service | Istio `RequestAuthentication` CRD at sidecar |
+| **JWT claim → ROLE_ mapping** | `JwtAuthenticationConverter` per service | Spring Security 仍然要做 (Istio 只負責 verify) |
+| **Forward inbound JWT outbound** | `FeignAuthForwardInterceptor` (手寫) | Envoy `EnvoyFilter` lua or auto pass-through |
+| **AuthZ rules** | `@PreAuthorize` / SecurityConfig | Istio `AuthorizationPolicy` CRD (or both) |
+
+#### Migration phases
+
+**Phase 1: Inject sidecar，preserve everything**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: onlineshopping
+  labels:
+    istio-injection: enabled  # ← Envoy sidecar 自動 inject
+```
+
+App code **一行唔改**，純粹驗 sidecar traffic interception 正常。
+
+**Phase 2: STRICT mTLS**
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: onlineshopping
+spec:
+  mtls:
+    mode: STRICT
+```
+
+所有 service-to-service traffic 強制 mTLS。任何冇 sidecar 嘅 caller 即時 reject。**App 仍然唔需要改 — JWT 流量繼續 work，mTLS 透明加密。**
+
+**Phase 3: Replace `oauth2-resource-server` with Istio `RequestAuthentication`**
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: jwt-on-ingress
+spec:
+  selector:
+    matchLabels:
+      app: product-service
+  jwtRules:
+    - issuer: "https://user-service"
+      jwksUri: "https://user-service/.well-known/jwks.json"
+      forwardOriginalToken: true  # ← 仍然將 JWT pass 落應用
+```
+
+Envoy sidecar 喺 receive request **之前** verify JWT。可以**移除每個 service pom 嘅 `spring-boot-starter-oauth2-resource-server`**。
+
+但係 — Spring Security `@PreAuthorize("hasRole('SELLER')")` 仍然要 work，所以需要寫一個 custom filter 從 `X-Authenticated-Claims` header (Istio 注入) 重建 `Authentication` object，或者保留 minimal JwtDecoder 純粹做 claim → Authority mapping。
+
+**Phase 4: Retire `FeignAuthForwardInterceptor`**
+
+Envoy 喺 outbound 階段已經自動帶 `Authorization` header (mesh 透明 proxy 所有 traffic) — 手寫 interceptor 變多餘。但 caveat：**如果 cart-svc 嘅 thread context 同 outbound request 唔係同一個 Envoy connection scope**，仍要靠 app 帶。實際 cost 唔大，部分團隊就保留 interceptor 多一道保險。
+
+#### 認唔可以 retire 嘅嘢
+
+| 仍然要 app code 做 | 點解 |
+|---|---|
+| JWT claim → `GrantedAuthority` mapping | Istio 只 verify signature，唔識你嘅 role 系統 |
+| `@PreAuthorize` / endpoint-level AuthZ | 業務規則 (`SELLER` 先 POST、`ADMIN` 先 DELETE) live in code |
+| Issue JWT (user-service) | Istio 唔 issue token，只 verify |
+| `/.well-known/jwks.json` endpoint | 仍由 user-service own (Istio 從度拎 public key) |
+
+#### 🎯 面試金句
+
+> "Service mesh doesn't replace JWT — they operate at different layers. mTLS authenticates the service, JWT authenticates the user. Istio lets you retire transport-level concerns: mTLS handshake replaces app-level TLS, `RequestAuthentication` CRD replaces `oauth2-resource-server` starter, and Envoy auto-forwards the `Authorization` header so the manual `FeignAuthForwardInterceptor` becomes redundant. What stays in the app is anything that requires business knowledge — claim-to-authority mapping, `@PreAuthorize` rules, JWT issuance. The win isn't fewer concerns; it's pushing cross-cutting concerns down to the platform layer so every team doesn't reimplement them."
+
+---
+
+### Q4 — Inventory Reservation Strategy 2 (Soft Reservation + TTL)
+
+L7 用 Strategy 1 (Amazon optimistic check at cart) — 加 cart 時只 read stock，唔 hold。**多 user 同時加最後一件 SKU 一律成功** → 高 user 體驗，但 oversell 可能性留俾 checkout 階段解。Strategy 2 適合 Ticketmaster 類 — **加 cart 即 hold 15min**，過期 release。
+
+#### Schema
+
+```sql
+CREATE TABLE inventory_reservation (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    product_id      BIGINT NOT NULL,
+    user_id         BIGINT NOT NULL,
+    quantity        INT NOT NULL CHECK (quantity > 0),
+    status          ENUM('ACTIVE','COMMITTED','RELEASED') NOT NULL DEFAULT 'ACTIVE',
+    expires_at      DATETIME(6) NOT NULL,
+    created_at      DATETIME(6) NOT NULL,
+    updated_at      DATETIME(6) NOT NULL,
+    version         BIGINT NOT NULL DEFAULT 0,
+    INDEX idx_expires_status (expires_at, status),
+    INDEX idx_user_product (user_id, product_id)
+);
+
+ALTER TABLE inventory ADD COLUMN reserved_stock INT NOT NULL DEFAULT 0;
+-- available = stock_quantity - reserved_stock
+```
+
+#### Atomic reservation (取代 check-then-act race)
+
+```java
+@Transactional
+public void reserve(Long productId, Long userId, int qty) {
+    int affected = inventoryRepo.tryReserve(productId, qty);
+    if (affected == 0) {
+        throw new InsufficientStockException(productId);
+    }
+    reservationRepo.save(Reservation.builder()
+        .productId(productId).userId(userId).quantity(qty)
+        .status(ACTIVE)
+        .expiresAt(LocalDateTime.now().plusMinutes(15))
+        .build());
+}
+```
+
+```sql
+-- inventoryRepo.tryReserve()
+UPDATE inventory
+SET reserved_stock = reserved_stock + :qty,
+    version = version + 1
+WHERE product_id = :productId
+  AND stock_quantity - reserved_stock >= :qty;
+```
+
+**單 statement** 既 check 又 update — MySQL row lock 保證 atomicity，影響 0 行 = 庫存不足。**冇 race window**，因為 check 同 update 喺同一個 SQL execution 入面，DB engine 用 row lock serialize 競爭。
+
+#### TTL cleanup job
+
+```java
+@Scheduled(fixedDelay = 60_000)
+public void releaseExpired() {
+    List<Reservation> expired = reservationRepo.findExpiredActive(LocalDateTime.now());
+    for (Reservation r : expired) {
+        int updated = reservationRepo.markReleasedIfActive(r.getId(), r.getVersion());
+        if (updated == 1) {
+            inventoryRepo.releaseReserved(r.getProductId(), r.getQuantity());
+            applicationEventPublisher.publishEvent(new ReservationExpiredEvent(r));
+        }
+    }
+}
+```
+
+```sql
+-- reservationRepo.markReleasedIfActive()
+UPDATE inventory_reservation
+SET status = 'RELEASED', version = version + 1, updated_at = NOW(6)
+WHERE id = :id AND version = :version AND status = 'ACTIVE';
+```
+
+Optimistic lock (`version`) + state check (`status = 'ACTIVE'`) 結合，**affected = 0 表示 race lost** — 可能 user 同一秒 checkout 咗，狀態已變 COMMITTED。
+
+#### Race condition 攻防 matrix
+
+| 場景 | Race window | 防禦 |
+|---|---|---|
+| **U1 + U2 同時 reserve 最後 1 件** | `check stock` vs `decrement` 之間 | `stock - reserved >= qty` 嘅 conditional UPDATE — 後者 affected 0 |
+| **U1 checkout vs TTL cron 同時** | mark COMMITTED vs mark RELEASED | `WHERE version = ? AND status = ACTIVE` — 後者 affected 0 |
+| **Service crash after reservation insert before cart insert** | partial write | 同一 `@Transactional` — 兩者 atomic |
+| **U1 加 cart 2 次同 product** | duplicate row | Upsert pattern: `findByUserProduct()` → exists 就 update 唔 insert |
+| **U1 改 cart qty 由 3 → 5** | delta race | Reservation expand: `UPDATE reserved_stock += 2 WHERE available >= 2` |
+
+#### Checkout commit (saga 落地)
+
+```java
+@Transactional
+public void commitReservation(Long reservationId) {
+    int affected = reservationRepo.markCommittedIfActive(reservationId);
+    if (affected == 0) {
+        throw new ReservationExpiredException();  // ← 超時，user 要重 add
+    }
+    // reserved_stock 自然消滅 (因為 stock_quantity -= qty 一齊執行)
+    inventoryRepo.commitReservation(productId, qty);
+}
+```
+
+```sql
+UPDATE inventory
+SET stock_quantity = stock_quantity - :qty,
+    reserved_stock = reserved_stock - :qty
+WHERE product_id = :productId;
+```
+
+#### Strategy 對比
+
+| | Strategy 1 (Amazon, L7) | **Strategy 2 (Ticketmaster, 呢題)** | Strategy 3 (Bank) |
+|---|---|---|---|
+| Cart 動 stock？ | ❌ check only | ✅ soft reserve | ✅ hard reserve |
+| TTL release？ | N/A | ✅ 15min auto | ❌ user 手動 cancel |
+| Oversell risk | 中 (checkout 解) | 低 | 零 |
+| UX friction | 最低 | 中 (timer) | 最高 (霸位唔買都唔放) |
+| 適用 | 海量 SKU 充足 | 限量稀缺品 | 金融 / 實名 |
+
+#### 🎯 面試金句
+
+> "Reservation is a UX vs consistency trade-off. Amazon prioritizes frictionless cart and resolves oversells at checkout. Ticketmaster prioritizes zero oversell with a soft reservation + TTL reaper. The race conditions are non-trivial — we eliminated the check-then-act window by combining stock comparison and decrement in a single conditional UPDATE: `WHERE stock - reserved >= :qty`. MySQL row lock guarantees serialization for concurrent reservation attempts. The TTL job uses optimistic lock plus state-machine guard to avoid releasing a reservation that just got committed."
+
+---
+
+### Q5 — OpenTelemetry W3C Trace Context Migration
+
+**核心理解：correlation ID vs trace context 唔同 expressiveness。**
+
+```
+L7 X-Correlation-ID:    flat string, 1 trace = 1 ID
+                        告訴你「呢幾條 log 屬於同一 request」
+                        但唔知 call relationship
+
+W3C traceparent:        Tree of spans (parent → child)
+                        告訴你「cart 既 call product 又 call inventory」
+                        + 每 span 嘅 timing
+                        + parallel vs sequential 分得到
+```
+
+#### `traceparent` header 格式
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                │
+             │  └─ trace_id (16 byte hex)        │                └─ flags (01 = sampled)
+             └─ version                          └─ parent_span_id (8 byte hex)
+
+tracestate: vendor1=xxx,vendor2=yyy  ← optional, vendor-specific
+```
+
+#### Migration plan (4 phases, ~6 weeks)
+
+**Phase 1 — Add OTel deps (Week 1)**
+
+```xml
+<!-- Spring Boot 3 已 baked-in Micrometer Tracing -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-otel</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-exporter-otlp</artifactId>
+</dependency>
+```
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 1.0           # dev: 100%, prod: 0.01-0.1
+  otlp:
+    tracing:
+      endpoint: http://jaeger:4318/v1/traces
+```
+
+Spring auto-wire `BraveTracer` 或 `OtelTracer` — 不再需要手寫 filter。
+
+**Phase 2 — Dual-emit transition (Week 2-3)**
+
+```yaml
+logging:
+  pattern:
+    console: "%d [traceId=%X{traceId:-no-trace},spanId=%X{spanId:-no-span},cid=%X{correlationId:-no-cid}] %-5level %logger - %msg%n"
+```
+
+Log line 同時 print 兩個 ID system：
+
+```
+2026-05-28 14:32:01 [traceId=4bf92f35..., spanId=00f067aa..., cid=l7-phase4-test-001] INFO ...
+```
+
+Dashboards / alerts / SRE workflows 逐步 migrate — 由 `grep cid=...` 過渡到 Jaeger UI。
+
+**Phase 3 — Retire `FeignCorrelationIdInterceptor` + `CorrelationIdFilter` (Week 4)**
+
+Micrometer Tracing 自動掛 `TracingFeignRequestInterceptor` — outbound Feign 自動帶 `traceparent`。Inbound side `ServerHttpObservationFilter` (auto-config) 自動 read `traceparent` 並 populate MDC。
+
+```
+- shared/common-web/CorrelationIdFilter.java          ← DELETE
+- services/cart-service/.../FeignCorrelationIdInterceptor.java  ← DELETE
+- log pattern 移除 %X{correlationId}                  ← REPLACE 成 %X{traceId}
+```
+
+Cart-service `CartServiceApplication` 嘅 `scanBasePackages` 可以摘走 `com.onlineshopping.common.web`（如果 common-web 只有呢個 filter）— 或者保留 module 等將來放其他 cross-cutting concern。
+
+**Phase 4 — Production sampling tuning (Week 5+)**
+
+| Sampling strategy | Pros | Cons |
+|---|---|---|
+| **Head sampling 1%** | 簡單 + 低 storage | Miss 99% errors |
+| **Tail sampling** (OTel Collector) | Sample all errors + slow + 1% baseline | Need collector infra + 短延遲 |
+| **Adaptive sampling** | 根據 QPS 動態調 | 配置複雜 |
+
+Production recommended: **Tail sampling via OTel Collector**：
+
+```yaml
+# otel-collector-config.yaml
+processors:
+  tail_sampling:
+    policies:
+      - name: errors-policy
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow-policy
+        type: latency
+        latency: { threshold_ms: 1000 }
+      - name: random-policy
+        type: probabilistic
+        probabilistic: { sampling_percentage: 1 }
+```
+
+100% sample 喺 service 邊收齊，OTel Collector 等 trace 完整再決定保唔保 — **每條 error + slow trace 都唔走**，正常 baseline 1%。
+
+#### 兼容性 caveat
+
+| 風險 | 解 |
+|---|---|
+| 上游系統仲 send `X-Correlation-ID` 唔 send `traceparent` | Filter 將 inbound `X-Correlation-ID` map 入 traceparent (synthesize new span) |
+| Async event (Kafka) propagation | Producer 將 trace context 寫入 Kafka header；consumer extract 並 resume trace |
+| 跨 thread (CompletableFuture / @Async) | Use `Context.taskWrapping(executor)` 包 thread pool — auto carry context |
+| External webhook callback | 跨組織 traceparent 互通通常唔成 — 起新 trace + log inbound trace ID as attribute |
+
+#### 🎯 面試金句
+
+> "We migrated from a homegrown `X-Correlation-ID` filter to OpenTelemetry W3C `traceparent`. The key insight is expressiveness — a flat correlation ID tells you which logs belong together but not the call relationship. Spans give you a DAG with parent-child links and timing. Spring Boot 3's Micrometer Tracing makes this almost zero-config: `micrometer-tracing-bridge-otel` auto-wires Feign interceptors and MDC injection. We ran a 4-week dual-emit transition logging both IDs so dashboards could migrate without breakage, then deleted the custom filter. For sampling, head-based 1% misses errors, so we use tail sampling at the OTel Collector — keep all errors and slow traces plus 1% baseline."
+
+---
+
+#### 🎯 Synthesis — Q1-Q5 之間嘅 link
+
+| Question | Connects to L7 codebase |
+|---|---|
+| Q1 (refresh + revocation) | 解 L7 token TTL 60min 嘅 UX/security trade-off 缺角 |
+| Q2 (integration test) | 補 L7 只有 unit test (CartServiceTest 5 cases) 嘅 coverage gap |
+| Q3 (service mesh) | 解釋 L7 嘅 `FeignAuthForwardInterceptor` + `oauth2-resource-server` 喺 Istio 時代邊個 retire、邊個 keep |
+| Q4 (reservation Strategy 2) | L7 Section 6 「3-Strategy Inventory Reservation Framework」嘅 Strategy 2 落地版 — L9 saga foundation |
+| Q5 (OpenTelemetry) | 將 L7 Phase 4 嘅 `CorrelationIdFilter` 升級到 industry standard — L15 hands-on rehearsal |
+
+呢 5 條題目連起嚟 = **「Auth + tracing + reservation 由 dev 落地 → production hardening」嘅 senior engineer checklist**。L7 codebase 落地咗 baseline (RS256 + JWKS + Feign propagation + correlation ID)，呢 5 條答案就係剩低 80% 嘅 production rigor — refresh rotation、test discipline、layered auth、race-free reservation、distributed tracing。
+
+</details>
+
 ---
 
 ## 13. Next Lesson Preview — Lesson 08
