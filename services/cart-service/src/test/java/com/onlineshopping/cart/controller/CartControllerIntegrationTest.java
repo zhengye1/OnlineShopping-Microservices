@@ -1,7 +1,10 @@
 package com.onlineshopping.cart.controller;
 
 import com.onlineshopping.cart.AbstractIntegrationTest;
+import com.onlineshopping.cart.entity.CartItem;
+import com.onlineshopping.cart.repository.CartItemRepository;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
@@ -29,7 +32,16 @@ class CartControllerIntegrationTest extends AbstractIntegrationTest {
     private static final long TEST_USER_ID = 42L;
     private static final long TEST_PRODUCT_ID = 100L;
 
+    @Autowired
+    private CartItemRepository cartItemRepo;
+
     // ─── WireMock stub helpers ──────────────────────────────────────────────
+
+    /** Stub product-service GET /products/{id} → 503 to simulate downstream outage. */
+    private void stubProductServiceDown(long productId) {
+        wireMock.stubFor(get(urlPathEqualTo("/products/" + productId))
+                .willReturn(aResponse().withStatus(503)));
+    }
 
     /** Stub product-service GET /products/{id} → 200 with a realistic body. */
     private void stubProductExists(long productId, long priceCents, String currency) {
@@ -129,6 +141,63 @@ class CartControllerIntegrationTest extends AbstractIntegrationTest {
                         .content(body))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.detail").value(containsString("Insufficient stock")));
+    }
+
+    // ─── L8 Phase 2: Resilience4j fallback scenarios ────────────────────────
+
+    @Test
+    void addItem_productServiceDown_existingCart_fallsBackToCachedPrice() throws Exception {
+        // GIVEN: user already has this product in cart with a snapshotted price.
+        cartItemRepo.save(CartItem.builder()
+                .userId(TEST_USER_ID)
+                .productId(TEST_PRODUCT_ID)
+                .quantity(3)
+                .priceAtAddition(8000L)       // snapshot from a previous add — IMPORTANT: stale
+                .currency("USD")
+                .build());
+
+        // AND: product-service is down (503).
+        stubProductServiceDown(TEST_PRODUCT_ID);
+        // BUT: inventory-service is healthy and has stock.
+        stubInventoryHasStock(TEST_PRODUCT_ID, 50);
+
+        String authHeader = mockJwtFor(TEST_USER_ID);
+        String body = addCartItemRequest(TEST_PRODUCT_ID, 2);
+
+        // WHEN: user adds 2 more units.
+        // THEN: CB fallback HIT — degraded mode succeeds using cached snapshot;
+        // priceAtAddition stays 8000 (the cached value, NOT the live price).
+        mockMvc.perform(post("/cart/items")
+                        .header("Authorization", authHeader)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.quantity").value(5))           // 3 + 2 = 5
+                .andExpect(jsonPath("$.priceAtAddition").value(8000)) // cached snapshot preserved
+                .andExpect(jsonPath("$.currency").value("USD"));      // cached currency preserved
+    }
+
+    @Test
+    void addItem_productServiceDown_newCart_returns503() throws Exception {
+        // GIVEN: product-service is down (503), user has NO prior cart row.
+        stubProductServiceDown(TEST_PRODUCT_ID);
+
+        String authHeader = mockJwtFor(TEST_USER_ID);
+        String body = addCartItemRequest(TEST_PRODUCT_ID, 2);
+
+        // WHEN: first-time add attempted.
+        // THEN: fallback MISS — no cached snapshot exists, so we refuse rather
+        // than fabricate a price. User sees a clean 503 with explanatory detail.
+        mockMvc.perform(post("/cart/items")
+                        .header("Authorization", authHeader)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.detail").value(containsString("Product service unavailable")));
+
+        // Defense-in-depth: inventory-service was NOT called — short-circuit on
+        // fallback miss before stock check (avoids unnecessary downstream load).
+        wireMock.verify(0, getRequestedFor(urlPathEqualTo("/inventory/" + TEST_PRODUCT_ID)));
     }
 
     @Test

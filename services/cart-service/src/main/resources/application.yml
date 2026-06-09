@@ -76,3 +76,54 @@ app:
     base-url: ${PRODUCT_SERVICE_URL:http://localhost:8082}
   inventory-service:
     base-url: ${INVENTORY_SERVICE_URL:http://localhost:8083}
+
+# ===== Resilience4j (L8) =====
+# Each downstream gets its own CB instance so failures isolate per service.
+resilience4j:
+  circuitbreaker:
+    instances:
+      productClient:
+        # Sliding window of last 10 calls — small enough for fast trip in tests
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        # Don't trip until we have 5 data points — avoid 1-fail-trips noise
+        minimum-number-of-calls: 5
+        # > 50% failure rate flips CLOSED → OPEN
+        failure-rate-threshold: 50
+        # Calls slower than 2s count as "slow" for slow-call-rate trip
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 50
+        # OPEN state lockout — drop traffic 30s before probing again
+        wait-duration-in-open-state: 30s
+        # HALF_OPEN: let 3 probe calls through to test recovery
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        # Trip on these exceptions (Feign throws FeignException + subclasses)
+        record-exceptions:
+          - feign.FeignException
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+        # Don't count these as failures (404 = downstream alive, just no record)
+        ignore-exceptions:
+          - feign.FeignException$NotFound
+
+# Aspect order — CRITICAL: swap to avoid the @Retry-outside-@CB trap.
+# Default order: Retry(CB(call)) means each retry attempt records to CB.
+# We want: CB(Retry(call)) — 1 user request = 1 CB record regardless of retry count.
+# Lower number = higher priority = OUTER aspect.
+resilience4j.circuitbreaker.circuit-breaker-aspect-order: 1
+resilience4j.retry.retry-aspect-order: 2
+
+# ===== Actuator =====
+# Expose health + metrics + circuitbreakers endpoints for chaos test verification.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics, circuitbreakers, circuitbreakerevents
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true

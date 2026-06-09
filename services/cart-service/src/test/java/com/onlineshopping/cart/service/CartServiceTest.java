@@ -2,7 +2,7 @@ package com.onlineshopping.cart.service;
 
 import com.onlineshopping.cart.client.InventoryClient;
 import com.onlineshopping.cart.client.InventoryStock;
-import com.onlineshopping.cart.client.ProductClient;
+import com.onlineshopping.cart.client.ResilientProductClient;
 import com.onlineshopping.cart.client.ProductSummary;
 import com.onlineshopping.cart.dto.AddCartItemRequest;
 import com.onlineshopping.cart.dto.CartItemResponse;
@@ -36,7 +36,7 @@ class CartServiceTest {
     @Mock
     private CartItemRepository cartItemRepo;
     @Mock
-    private ProductClient productClient;
+    private ResilientProductClient productClient;
     @Mock
     private InventoryClient inventoryClient;
 
@@ -64,7 +64,7 @@ class CartServiceTest {
     @Test
     void happyPath_insertsNewItem_snapshotsPriceAndCurrency() {
         AddCartItemRequest req = new AddCartItemRequest(PRODUCT_ID, 2);
-        when(productClient.findById(PRODUCT_ID)).thenReturn(sampleProduct());
+        when(productClient.findById(USER_ID, PRODUCT_ID)).thenReturn(sampleProduct());
         when(inventoryClient.getStock(PRODUCT_ID)).thenReturn(sampleStock(50));
         when(cartItemRepo.findById(new CartItemId(USER_ID, PRODUCT_ID))).thenReturn(Optional.empty());
         when(cartItemRepo.save(any(CartItem.class))).thenAnswer(inv -> inv.getArgument(0));
@@ -99,7 +99,7 @@ class CartServiceTest {
 
         AddCartItemRequest req = new AddCartItemRequest(PRODUCT_ID, 2);
         // Product price 已經升 9900 (current)，但 cart 應該 keep 原 8000
-        when(productClient.findById(PRODUCT_ID)).thenReturn(sampleProduct());
+        when(productClient.findById(USER_ID, PRODUCT_ID)).thenReturn(sampleProduct());
         when(inventoryClient.getStock(PRODUCT_ID)).thenReturn(sampleStock(50));
         when(cartItemRepo.findById(new CartItemId(USER_ID, PRODUCT_ID))).thenReturn(Optional.of(existing));
         when(cartItemRepo.save(any(CartItem.class))).thenAnswer(inv -> inv.getArgument(0));
@@ -136,7 +136,7 @@ class CartServiceTest {
                 .currency("CAD")
                 .build();
         AddCartItemRequest req = new AddCartItemRequest(PRODUCT_ID, 10);
-        when(productClient.findById(PRODUCT_ID)).thenReturn(sampleProduct());
+        when(productClient.findById(USER_ID, PRODUCT_ID)).thenReturn(sampleProduct());
         when(inventoryClient.getStock(PRODUCT_ID)).thenReturn(sampleStock(15));
         when(cartItemRepo.findById(new CartItemId(USER_ID, PRODUCT_ID))).thenReturn(Optional.of(existing));
 
@@ -150,7 +150,7 @@ class CartServiceTest {
     // CASE 4 — productNotFound_throws404
     @Test
     void productNotFound_throws404(){
-        when(productClient.findById(any())).thenThrow(notFound("/products/100"));
+        when(productClient.findById(any(), any())).thenThrow(notFound("/products/100"));
         AddCartItemRequest req = new AddCartItemRequest(PRODUCT_ID, 10);
         assertThatThrownBy(() ->cartService.addItem(USER_ID, req))
                 .satisfies(e -> assertThat(((ResponseStatusException) e).getStatusCode())
@@ -163,7 +163,7 @@ class CartServiceTest {
     @Test
     void inventoryNotFound_throws404(){
         AddCartItemRequest req = new AddCartItemRequest(PRODUCT_ID, 10);
-        when(productClient.findById(PRODUCT_ID)).thenReturn(sampleProduct());
+        when(productClient.findById(USER_ID, PRODUCT_ID)).thenReturn(sampleProduct());
         when(inventoryClient.getStock(any())).thenThrow(notFound("/inventory/100"));
         assertThatThrownBy(() ->cartService.addItem(USER_ID, req))
                 .satisfies(e -> assertThat(((ResponseStatusException) e).getStatusCode())
