@@ -21,6 +21,7 @@
         <spring-cloud.version>2025.0.0</spring-cloud.version>
         <testcontainers.version>1.21.4</testcontainers.version>
         <wiremock.version>3.10.0</wiremock.version>
+        <resilience4j.version>2.2.0</resilience4j.version>
     </properties>
 
     <dependencyManagement>
@@ -79,6 +80,31 @@
         <dependency>
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-openfeign</artifactId>
+        </dependency>
+
+        <!-- Resilience4j — circuit breaker, retry, bulkhead, timeout (L8) -->
+        <!-- spring-boot3 starter pulls AOP + actuator metrics integration -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+        <!-- Reactor needed by resilience4j-spring-boot3 even in pure servlet apps -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-reactor</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+        <!-- Micrometer integration — exposes CB state + failure rate as metrics -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-micrometer</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+        <!-- Actuator — exposes /actuator/health with CB state aggregated -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
         <!-- Lombok -->

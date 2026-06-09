@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.onlineshopping.cart.repository.CartItemRepository;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,8 +19,6 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import static org.mockito.ArgumentMatchers.anyString;
@@ -78,16 +75,27 @@ import static org.mockito.Mockito.when;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @AutoConfigureMockMvc
-@Testcontainers
 @ActiveProfiles("test")
 public abstract class AbstractIntegrationTest {
 
-    @Container
+    // Singleton container — started once per JVM via static initializer,
+    // shared across ALL test classes that extend AbstractIntegrationTest.
+    //
+    // Why not @Container + @Testcontainers? Those wire the container's
+    // lifecycle to the test class — when class A finishes, the container
+    // stops, leaving class B to crash on JDBC connect. Since two integration
+    // test classes share this static field, we need JVM-scoped lifecycle.
     @ServiceConnection
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>(DockerImageName.parse("mysql:8.4"))
-            .withDatabaseName("cart_service_test")
-            .withUsername("test")
-            .withPassword("test");
+    static final MySQLContainer<?> MYSQL;
+
+    static {
+        MYSQL = new MySQLContainer<>(DockerImageName.parse("mysql:8.4"))
+                .withDatabaseName("cart_service_test")
+                .withUsername("test")
+                .withPassword("test");
+        MYSQL.start();
+        Runtime.getRuntime().addShutdownHook(new Thread(MYSQL::stop));
+    }
 
     protected static final WireMockServer wireMock = new WireMockServer(
             WireMockConfiguration.wireMockConfig().dynamicPort()
@@ -95,13 +103,17 @@ public abstract class AbstractIntegrationTest {
 
     @BeforeAll
     static void startWireMock() {
-        wireMock.start();
+        // Idempotent — multiple integration test classes share this static
+        // WireMock instance. Without this guard, the second class's @BeforeAll
+        // would fail because the JVM-shared server is already running.
+        if (!wireMock.isRunning()) {
+            wireMock.start();
+        }
     }
 
-    @AfterAll
-    static void stopWireMock() {
-        wireMock.stop();
-    }
+    // No @AfterAll stop — JVM exit cleans up the WireMock server. Stopping in
+    // @AfterAll breaks any subsequent test class that wants to use the same
+    // static instance.
 
     @AfterEach
     void resetWireMock() {

@@ -2,8 +2,8 @@ package com.onlineshopping.cart.service;
 
 import com.onlineshopping.cart.client.InventoryClient;
 import com.onlineshopping.cart.client.InventoryStock;
-import com.onlineshopping.cart.client.ProductClient;
 import com.onlineshopping.cart.client.ProductSummary;
+import com.onlineshopping.cart.client.ResilientProductClient;
 import com.onlineshopping.cart.dto.AddCartItemRequest;
 import com.onlineshopping.cart.dto.CartItemResponse;
 import com.onlineshopping.cart.entity.CartItem;
@@ -33,15 +33,16 @@ import java.util.Optional;
 public class CartService {
 
     private final CartItemRepository cartItemRepo;
-    private final ProductClient productClient;
+    private final ResilientProductClient productClient;
     private final InventoryClient inventoryClient;
 
     @Transactional
     public CartItemResponse addItem(Long userId, AddCartItemRequest req) {
         // 1. Validate product exists + get price snapshot (forwards user JWT via interceptor)
+        // userId passed so ResilientProductClient fallback can look up cached cart_items snapshot.
         ProductSummary product;
         try {
-            product = productClient.findById(req.productId());
+            product = productClient.findById(userId, req.productId());
         } catch (FeignException.NotFound e) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND,
                     "Product not found: " + req.productId());
