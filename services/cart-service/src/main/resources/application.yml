@@ -107,6 +107,40 @@ resilience4j:
         ignore-exceptions:
           - feign.FeignException$NotFound
 
+  # ===== Retry (L8 Phase 3) =====
+  retry:
+    instances:
+      productClient:
+        # 3 total attempts (first + 2 retries). Higher counts trigger retry
+        # storm during partial outages — each extra attempt multiplies
+        # downstream load on the already-struggling service.
+        max-attempts: 3
+        # Initial wait before first retry. Exponential growth from here.
+        wait-duration: 500ms
+        # 500ms → 1s → 2s growth — exponential gives downstream room to recover.
+        exponential-backoff-multiplier: 2
+        # ±30% jitter spread retries across a window — without jitter, every
+        # client retries at the same instant and creates a thundering herd.
+        # AWS-style "full jitter" alternative would set this to 1.0.
+        randomized-wait-factor: 0.3
+        # Only retry transient failures. 5xx and network errors can plausibly
+        # resolve on retry; semantic errors (4xx) and CB OPEN cannot.
+        retry-exceptions:
+          - feign.FeignException$InternalServerError
+          - feign.FeignException$BadGateway
+          - feign.FeignException$ServiceUnavailable
+          - feign.FeignException$GatewayTimeout
+          - feign.RetryableException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+        # NEVER retry these — pure waste of time.
+        ignore-exceptions:
+          - feign.FeignException$NotFound
+          - feign.FeignException$BadRequest
+          - feign.FeignException$Unauthorized
+          - feign.FeignException$Forbidden
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+
 # Aspect order — CRITICAL: swap to avoid the @Retry-outside-@CB trap.
 # Default order: Retry(CB(call)) means each retry attempt records to CB.
 # We want: CB(Retry(call)) — 1 user request = 1 CB record regardless of retry count.

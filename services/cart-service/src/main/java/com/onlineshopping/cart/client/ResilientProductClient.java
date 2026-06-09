@@ -6,6 +6,7 @@ import com.onlineshopping.cart.repository.CartItemRepository;
 import feign.FeignException;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -43,14 +44,24 @@ public class ResilientProductClient {
     private final CartItemRepository cartItemRepo;
 
     /**
-     * Lookup product, protected by the {@code productClient} circuit breaker.
+     * Lookup product, protected by Resilience4j @Retry + @CircuitBreaker.
      *
-     * <p>On CB OPEN or downstream failure, {@link #findByIdFallback} kicks in.
+     * <p>Aspect order (set in application.yml): CB outermost, Retry inside.
+     * So a request flows: CB state check → if CLOSED, enter Retry → call
+     * Feign up to 3 times with exponential backoff + jitter → on final
+     * failure (or non-retryable exception), CB records ONE failure and
+     * routes to {@link #findByIdFallback}.
+     *
+     * <p>This ordering matters: with the default Resilience4j order
+     * (Retry outside CB), every retry attempt becomes a separate CB
+     * statistic, inflating the failure rate by the retry count and
+     * tripping CB prematurely.
      *
      * <p>{@code userId} is required so the fallback can look up the user's
      * cart for a cached priceAtAddition snapshot.
      */
     @CircuitBreaker(name = "productClient", fallbackMethod = "findByIdFallback")
+    @Retry(name = "productClient")
     public ProductSummary findById(Long userId, Long productId) {
         log.debug("ResilientProductClient: forwarding findById(userId={}, productId={}) to Feign",
                 userId, productId);

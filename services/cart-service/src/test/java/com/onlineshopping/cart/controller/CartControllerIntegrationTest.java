@@ -178,6 +178,53 @@ class CartControllerIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void addItem_transientError_recoversAfterRetry() throws Exception {
+        // GIVEN: product-service fails twice with 503, then succeeds on 3rd try.
+        // This simulates a transient hiccup (load spike / brief network issue)
+        // that retry should recover from automatically.
+        //
+        // WireMock scenarios = stateful stub graph. We define 3 states:
+        //   "started" → "after-first-fail" → "after-second-fail"
+        // and chain stubs to walk through them. Resilience4j's 3 attempts
+        // (1 initial + 2 retries) should hit all 3 states.
+        wireMock.stubFor(get(urlPathEqualTo("/products/" + TEST_PRODUCT_ID))
+                .inScenario("transient-503")
+                .whenScenarioStateIs("Started")
+                .willReturn(aResponse().withStatus(503))
+                .willSetStateTo("after-first-fail"));
+        wireMock.stubFor(get(urlPathEqualTo("/products/" + TEST_PRODUCT_ID))
+                .inScenario("transient-503")
+                .whenScenarioStateIs("after-first-fail")
+                .willReturn(aResponse().withStatus(503))
+                .willSetStateTo("after-second-fail"));
+        wireMock.stubFor(get(urlPathEqualTo("/products/" + TEST_PRODUCT_ID))
+                .inScenario("transient-503")
+                .whenScenarioStateIs("after-second-fail")
+                .willReturn(okJson("""
+                        {
+                          "id": %d, "name": "Test", "sku": "T-1",
+                          "priceCents": 9999, "currency": "CAD", "status": "ACTIVE"
+                        }
+                        """.formatted(TEST_PRODUCT_ID))));
+        stubInventoryHasStock(TEST_PRODUCT_ID, 50);
+
+        String authHeader = mockJwtFor(TEST_USER_ID);
+        String body = addCartItemRequest(TEST_PRODUCT_ID, 2);
+
+        // WHEN: first-time add (no cart row yet — no fallback path possible).
+        // THEN: retry rescues the call; user sees 201 with live price, NOT 503.
+        mockMvc.perform(post("/cart/items")
+                        .header("Authorization", authHeader)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.priceAtAddition").value(9999L));
+
+        // Verify product-service was actually hit 3 times — proves retry ran.
+        wireMock.verify(3, getRequestedFor(urlPathEqualTo("/products/" + TEST_PRODUCT_ID)));
+    }
+
+    @Test
     void addItem_productServiceDown_newCart_returns503() throws Exception {
         // GIVEN: product-service is down (503), user has NO prior cart row.
         stubProductServiceDown(TEST_PRODUCT_ID);
