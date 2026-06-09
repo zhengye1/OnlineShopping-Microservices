@@ -1,0 +1,25 @@
+# cart-service integration test overrides
+# Testcontainers @ServiceConnection wires DataSource at runtime.
+# Feign base URLs are wired via @DynamicPropertySource in AbstractIntegrationTest.
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+  flyway:
+    enabled: true
+
+  # JWKS URI placeholder — NimbusJwtDecoder constructs lazily and never fetches
+  # because tests inject auth via SecurityMockMvcRequestPostProcessors.jwt()
+  # which bypasses the decoder entirely.
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:0/never-fetched
+
+logging:
+  level:
+    com.onlineshopping: DEBUG
+    org.testcontainers: INFO
+    com.github.tomakehurst.wiremock: INFO

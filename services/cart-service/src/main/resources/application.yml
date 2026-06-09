@@ -40,6 +40,15 @@ spring:
       resourceserver:
         jwt:
           jwk-set-uri: ${JWT_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+
+  # ===== Error response: RFC 7807 ProblemDetail =====
+  # Emit { type, title, status, detail, instance } for ResponseStatusException
+  # (matches Stripe / GitHub API convention; replaces Spring Boot default
+  # /error forward whose body MockMvc cannot follow).
+  mvc:
+    problemdetails:
+      enabled: true
+
   output:
     ansi:
       enabled: always
