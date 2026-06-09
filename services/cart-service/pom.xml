@@ -20,6 +20,7 @@
     <properties>
         <spring-cloud.version>2025.0.0</spring-cloud.version>
         <testcontainers.version>1.21.4</testcontainers.version>
+        <wiremock.version>3.10.0</wiremock.version>
     </properties>
 
     <dependencyManagement>
@@ -123,6 +124,14 @@
             <groupId>org.testcontainers</groupId>
             <artifactId>mysql</artifactId>
             <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- WireMock — shaded standalone bundle avoids Jetty/Jakarta servlet API clash with Spring Boot 3 -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>${wiremock.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
