@@ -703,6 +703,545 @@ What we **did not** build in L8, that real production would add:
 
 5. **Distributed CB state via Redis** — Resilience4j is per-instance by default. If you have 10 cart-service replicas, each has its own CB state, so a downstream failure trips the CB on instance #1 but not instances #2-10. Until enough traffic flows through #2-10 to trip them too, those instances keep hammering the dead downstream. Design a solution: how would you share CB state across replicas? What's the trade-off vs the default per-instance approach?
 
+<details>
+<summary><strong>📖 Polished Solutions (L9 session fold-back)</strong></summary>
+
+> 小V 嘅 cold-attempt notes: full surrender (0/180) — L8 hw set 故意全部係 staff-level question，需要 hands-on production experience (Bulkhead chaos test、PromQL 寫 alert、distributed CB design) 先答得齊。同 L6 35/170、L7 26/180 嘅 cadence 一致 — 先見過 polished solution，下次面試 frame 起就快。
+
+---
+
+### Q1 — Apply CB + Retry to `InventoryClient`
+
+Pattern 同 ProductClient 一樣 — 但 **fallback strategy 完全唔同**，因為 cart_items 表唔係 inventory 嘅 cache。Inventory degraded mode 嘅 design decision 比 product 更難。
+
+#### Why the cart_items cache trick doesn't carry over
+
+```
+ProductClient fallback:
+  cart_items.priceAtAddition + currency → 重建 ProductSummary ✅
+
+InventoryClient fallback:
+  cart_items 冇 stock_quantity snapshot — 我哋只 snapshot price，唔 snapshot stock
+  即使 snapshot 咗 stock，stock 變化快 — 30 秒前嘅 stock 已經唔可靠
+  Risk: 用 stale stock allow add → 之後 checkout 撞 oversell → user 失望
+```
+
+**結論：inventory fallback 唔可以 fail-soft，必須 fail-fast。**
+
+#### Decision matrix — inventory 嘅 degraded mode
+
+| Scenario | Fallback strategy | Why |
+|---|---|---|
+| **Add-to-cart**（呢度）| Fail-fast 503 | 拒絕 < oversell — correctness > availability |
+| **Browse product page (read-only stock)** | Cached stock OK，標 "approximate" | UX > correctness — browsing 唔 commit |
+| **Checkout** (L9 saga) | Hard 503 + retry queue | Financial — 絕對唔可以 oversell |
+
+#### Code
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ResilientInventoryClient {
+
+    private final InventoryClient inventoryClient;
+
+    @CircuitBreaker(name = "inventoryClient", fallbackMethod = "getStockFallback")
+    @Retry(name = "inventoryClient")
+    public InventoryStock getStock(Long productId) {
+        return inventoryClient.getStock(productId);
+    }
+
+    public InventoryStock getStockFallback(Long productId, Throwable cause) {
+        if (cause instanceof FeignException.NotFound) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND,
+                    "Inventory record missing for product: " + productId);
+        }
+
+        // No cached snapshot, no safe fallback. Fail-fast.
+        log.warn("ResilientInventoryClient fallback REJECTED for productId={} cause={} "
+                + "→ inventory service unavailable, refusing add-to-cart",
+                productId, cause.getClass().getSimpleName());
+        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                "Inventory service unavailable; cannot verify stock");
+    }
+}
+```
+
+#### application.yml — separate CB instance, same threshold knobs
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      inventoryClient:           # ← separate instance, independent state machine
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        ignore-exceptions:
+          - feign.FeignException$NotFound
+  retry:
+    instances:
+      inventoryClient:
+        max-attempts: 3
+        wait-duration: 500ms
+        exponential-backoff-multiplier: 2
+        randomized-wait-factor: 0.3
+        retry-exceptions:
+          - feign.FeignException$InternalServerError
+          - feign.FeignException$BadGateway
+          - feign.FeignException$ServiceUnavailable
+          - feign.FeignException$GatewayTimeout
+          - feign.RetryableException
+          - java.net.SocketTimeoutException
+        ignore-exceptions:
+          - feign.FeignException$NotFound
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+```
+
+#### Senior insight — failure isolation per downstream
+
+每個 downstream 應該有**獨立** CB instance。原因：
+
+> Inventory 死 → 唔應該 trip product 嘅 CB。
+> Product 死 → 唔應該 trip inventory 嘅 CB。
+
+如果共用 instance，相當於將兩個獨立故障 source 嘅 statistics 撈埋 — sliding window 入面 50% 失敗可能其實只係 inventory 100% 死、product 100% 健康，CB trip 全部 traffic 但其實 product 仲可以 serve。
+
+#### 🎯 Interview talking point
+
+> "We use one CircuitBreaker instance per downstream service. Sharing a single CB across multiple downstreams would conflate failure signals — a failing inventory service would trip the breaker for product calls too, even though product is healthy. Failure isolation is the entire reason we extracted these into separate microservices; the resilience layer must respect that boundary."
+
+---
+
+### Q2 — `@Bulkhead` with semaphore + chaos test
+
+`@Bulkhead` 係 Resilience4j 嘅第 3 個 protection pattern（CB + Retry + Bulkhead），但解嘅問題完全唔同：
+
+| Pattern | 解咩問題 |
+|---|---|
+| `@CircuitBreaker` | Downstream **長期** 死 — 唔好嘥 thread 去等 |
+| `@TimeLimiter` | 單 call **timeout** — 唔好等個 call 超過 X 秒 |
+| `@Bulkhead` | **Concurrency cap** — 限同時多少個 in-flight call |
+
+### Semaphore vs ThreadPool Bulkhead
+
+| Type | How it works | Use case |
+|---|---|---|
+| **Semaphore** ⭐ | Counter — `maxConcurrentCalls` 個 permit，攞到先入 | Synchronous Spring MVC — 用緊 caller thread |
+| **ThreadPool** | 獨立 thread pool — submit task 入個 queue | Reactive / async — 隔離 caller 同 downstream thread |
+
+For cart-service (Servlet stack) — Semaphore 啱。
+
+#### Config
+
+```yaml
+resilience4j:
+  bulkhead:
+    instances:
+      productClient:
+        max-concurrent-calls: 10       # 同時最多 10 個 in-flight
+        max-wait-duration: 0           # 11th call 即時 reject (BulkheadFullException)
+```
+
+#### Code
+
+```java
+@CircuitBreaker(name = "productClient", fallbackMethod = "findByIdFallback")
+@Retry(name = "productClient")
+@Bulkhead(name = "productClient")    // ← 加 Bulkhead
+public ProductSummary findById(Long userId, Long productId) {
+    return productClient.findById(productId);
+}
+```
+
+Aspect order matters again. Resilience4j default order from outer→inner:
+```
+@Retry → @CircuitBreaker → @RateLimiter → @TimeLimiter → @Bulkhead → method
+```
+
+Bulkhead 喺最內層 — 即係 attempt admission control **after** CB check + Retry decision. 我哋 L8 swap 咗 CB / Retry 順序，Bulkhead 仍然最內。
+
+#### Chaos test pattern
+
+```java
+@Test
+void bulkhead_limitsConcurrentCallsTo10() throws Exception {
+    // Stub product-svc to be slow — every call takes 2 seconds
+    wireMock.stubFor(get(urlPathEqualTo("/products/" + TEST_PRODUCT_ID))
+            .willReturn(okJson(productJson()).withFixedDelay(2000)));
+    stubInventoryHasStock(TEST_PRODUCT_ID, 1000);
+    String authHeader = mockJwtFor(TEST_USER_ID);
+
+    int totalRequests = 20;
+    int parallelism = 20;
+    ExecutorService pool = Executors.newFixedThreadPool(parallelism);
+    CountDownLatch ready = new CountDownLatch(parallelism);
+    CountDownLatch go = new CountDownLatch(1);
+
+    AtomicInteger succeeded = new AtomicInteger();
+    AtomicInteger bulkheadRejected = new AtomicInteger();
+
+    for (int i = 0; i < totalRequests; i++) {
+        pool.submit(() -> {
+            try {
+                ready.countDown();
+                go.await();
+                int status = mockMvc.perform(post("/cart/items")
+                        .header("Authorization", authHeader)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                        .andReturn().getResponse().getStatus();
+                if (status == 201) succeeded.incrementAndGet();
+                else if (status == 503 || status == 429) bulkheadRejected.incrementAndGet();
+            } catch (Exception e) { /* ignore */ }
+        });
+    }
+    ready.await();   // wait until all threads ready
+    go.countDown();  // fire simultaneously
+    pool.shutdown();
+    pool.awaitTermination(30, TimeUnit.SECONDS);
+
+    // 10 fit in bulkhead, 10 rejected
+    assertThat(succeeded.get()).isEqualTo(10);
+    assertThat(bulkheadRejected.get()).isEqualTo(10);
+}
+```
+
+#### Bulkhead vs TimeLimiter — combine 用最 powerful
+
+```
+@TimeLimiter alone:
+  Slow call 等到 timeout → 釋放 thread → 下一個 call 入嚟 → 又等 timeout...
+  ⚠️ 系統「健康」但 throughput 跌晒
+  
+@Bulkhead alone:
+  限 10 個 concurrent call，但每個 call 可以等到天荒地老
+  ⚠️ 10 個 thread 永遠 stuck
+
+@TimeLimiter + @Bulkhead:
+  10 個 concurrent 上限
+  每個 call 必須 < 2s 完成
+  ⭐ 兩條 dimension 都有 cap，maxThreadConsumption = 10, maxStuckTime = 2s
+```
+
+#### 🎯 Interview talking point
+
+> "Bulkhead caps how many calls can be in-flight at once; TimeLimiter caps how long any single call can take. They protect different failure modes. A slow downstream without TimeLimiter ties up bulkhead permits indefinitely. A high-throughput downstream without Bulkhead can still exhaust the caller thread pool even if each call returns quickly. Production-grade resilience usually wires all three: CB for sustained failures, TimeLimiter for per-call latency cap, Bulkhead for concurrency cap."
+
+---
+
+### Q3 — Tuning thresholds for high-QPS vs low-QPS-critical
+
+呢條 tuning 直覺需要 production 經驗。我畀你 mental model 同兩個 reference config。
+
+#### Mental model — 三條 dimensions
+
+| Knob | 高 traffic 時應該 | 低 traffic 時應該 |
+|---|---|---|
+| `sliding-window-size` | 大 (100-1000) — smooth out noise | 細 (10-30) — react 快啲 |
+| `minimum-number-of-calls` | 大 (50-100) — 充份 samples | 細 (5-10) — 唔可以等太耐 |
+| `failure-rate-threshold` | 中 (30-50%) — sensitive 啲，因為 downstream 影響大 | 低 (15-25%) — financial critical，唔可以容忍 |
+| `slow-call-duration` | 行業 SLO (eg 200ms) | Lower (eg 500ms for payment) |
+
+#### Config — 1000 QPS service (例如 product browse)
+
+```yaml
+resilience4j.circuitbreaker.instances.productBrowse:
+  sliding-window-type: COUNT_BASED
+  sliding-window-size: 100              # 0.1 秒 traffic = sufficient
+  minimum-number-of-calls: 50           # 5% × 1000 QPS = 50 samples in 50ms
+  failure-rate-threshold: 30            # 30% fail = clearly broken
+  slow-call-rate-threshold: 30
+  slow-call-duration-threshold: 200ms   # browse 應該 fast
+  wait-duration-in-open-state: 10s      # 高 traffic 可以早啲 probe recovery
+  permitted-number-of-calls-in-half-open-state: 10
+```
+
+**Rationale**: high QPS 即係統計樣本充份 — 可以用大 window 拉走 noise，trip 嘅 threshold 可以更靈敏（因為 false positive 嘅 cost 細，下一秒已經有新樣本確認）。
+
+#### Config — 10 QPS critical service (例如 payment)
+
+```yaml
+resilience4j.circuitbreaker.instances.paymentProcessor:
+  sliding-window-type: TIME_BASED       # ← switch to time-based 因為 traffic 太細
+  sliding-window-size: 60               # 60 秒 window
+  minimum-number-of-calls: 10           # 至少 10 個 sample 先 decide
+  failure-rate-threshold: 20            # 20% fail = financial alert
+  slow-call-rate-threshold: 20
+  slow-call-duration-threshold: 500ms   # payment > 500ms = abnormal
+  wait-duration-in-open-state: 60s      # 低 traffic 用長 cool-down 避免 yo-yo
+  permitted-number-of-calls-in-half-open-state: 3
+```
+
+**Rationale**: low QPS = noise can hide signals — 需要更長 window + 更多 samples 才 trip。Financial 嘅 cost-of-failure 高，failure rate threshold 要低。COUNT_BASED 喺低 traffic 反應慢（要等夠 size 個 samples），TIME_BASED 用時間框界限。
+
+#### Common trap — over-sensitive trip 嘅後果
+
+```
+sliding-window=10, min-calls=5, failure-rate=20%
+→ 1 個 fail 入 5 samples = 20% → trip 即刻
+→ 但其實 1/5 可能純粹 noise (network jitter / restart 中)
+→ False positive trip → 30 秒 fast-fail → user 唔開心
+```
+
+對應 prevention：**`minimum-number-of-calls` 要至少 30-50%** of sliding window，等樣本數量真正 statistically meaningful。
+
+#### 🎯 Interview talking point
+
+> "Thresholds depend on traffic volume and risk tolerance. High-QPS services have plenty of statistical samples, so we can use a large window with a moderate failure-rate threshold and react fast. Low-QPS critical services like payment have less data but higher cost-of-failure — we use TIME_BASED windows, longer cool-down periods, and lower failure-rate thresholds. The trap with low traffic is false positive trips from random noise; setting minimum-number-of-calls to at least 30% of the window size keeps the statistic meaningful."
+
+---
+
+### Q4 — Prometheus scrape + PromQL alert
+
+#### `prometheus.yml` scrape config
+
+```yaml
+scrape_configs:
+  - job_name: 'cart-service'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ['cart-service:8084']
+        labels:
+          service: cart-service
+          team: commerce
+```
+
+Spring Boot 嘅 actuator endpoint 唔係預設 expose Prometheus format — 要加埋 dep：
+
+```xml
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+    <scope>runtime</scope>
+</dependency>
+```
+
+同 `application.yml` enable：
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics, circuitbreakers, prometheus
+```
+
+#### Resilience4j Prometheus metrics
+
+關鍵 metric names (Resilience4j-Micrometer naming convention):
+
+```
+resilience4j_circuitbreaker_state{name="productClient", state="open"}    # 0 or 1
+resilience4j_circuitbreaker_state{name="productClient", state="closed"}  # 0 or 1
+resilience4j_circuitbreaker_state{name="productClient", state="half_open"}
+resilience4j_circuitbreaker_calls_total{name="productClient", kind="successful"}
+resilience4j_circuitbreaker_calls_total{name="productClient", kind="failed"}
+resilience4j_circuitbreaker_calls_total{name="productClient", kind="not_permitted"}
+resilience4j_circuitbreaker_failure_rate{name="productClient"}
+resilience4j_circuitbreaker_slow_call_rate{name="productClient"}
+```
+
+`state` label 嘅值係 gauge — `1` 表示 active state，`0` 表示 not。所以 `state="open"` = 1 即係 CB 而家係 OPEN。
+
+#### PromQL alert rule
+
+```yaml
+groups:
+  - name: cart-service-resilience
+    interval: 30s
+    rules:
+      - alert: ProductClientCircuitBreakerOpen
+        # avg_over_time gives the fraction of the past 5min where CB was OPEN
+        # > 0.5 = OPEN for more than half the window = persistent, not flap
+        expr: |
+          avg_over_time(
+            resilience4j_circuitbreaker_state{name="productClient", state="open"}[5m]
+          ) > 0.5
+        for: 5m                         # require alert condition for 5 consecutive minutes
+        labels:
+          severity: warning
+          team: commerce
+          runbook: https://runbooks.internal/cart-cb-open
+        annotations:
+          summary: "cart-service productClient circuit breaker OPEN for 5+ minutes"
+          description: |
+            cart-service instance {{ $labels.instance }} has had its productClient
+            circuit breaker in OPEN state for at least 5 minutes. This means product
+            service has been failing or slow continuously. Users adding new items to
+            cart will see 503 (no cached snapshot available).
+            
+            Check: 
+              1. product-service health: kubectl -n commerce get pods -l app=product-service
+              2. product-service error logs: kubectl logs -l app=product-service --tail=100
+              3. Network: kubectl exec ... -- curl http://product-service:8082/actuator/health
+```
+
+#### Why `for: 5m` AND `avg_over_time(...)[5m] > 0.5`?
+
+```
+[5m] in expression: averages the metric over 5-minute lookback
+for: 5m: requires the expression to be true for 5 consecutive minutes
+```
+
+兩個 layer 防 false positive：
+- `avg_over_time > 0.5` filters out brief CB flap (e.g. CB trip → close → trip cycle)
+- `for: 5m` 確保 trend 持續，避免 1 個 metric scrape glitch trigger
+
+**Production rule**: alert SHOULD be `for: at least 2× scrape interval` — 否則一個 missed scrape 就會 false-fire alert。我哋 scrape interval 15s，所以 `for: 5m` 安全。
+
+#### Additional alerts worth setting up
+
+```promql
+# Failure rate trending up (early warning)
+- alert: ProductClientFailureRateRising
+  expr: resilience4j_circuitbreaker_failure_rate{name="productClient"} > 0.3
+  for: 2m
+
+# Bulkhead rejecting calls (capacity issue)
+- alert: ProductClientBulkheadFull
+  expr: rate(resilience4j_bulkhead_available_concurrent_calls{name="productClient"}[1m]) == 0
+  for: 1m
+
+# Retry attempts elevated (transient errors widespread)
+- alert: ProductClientRetryStorm
+  expr: rate(resilience4j_retry_calls_total{name="productClient", kind="failed_with_retry"}[5m]) > 50
+  for: 5m
+```
+
+#### 🎯 Interview talking point
+
+> "We expose Resilience4j metrics through Spring Boot Actuator + Micrometer's Prometheus registry. The key metric is `resilience4j_circuitbreaker_state{state='open'}` — a gauge that's 1 when the CB is open. The PromQL alert uses `avg_over_time(...)[5m] > 0.5` to require sustained openness rather than alerting on transient flips, plus `for: 5m` for double protection against scrape glitches. Three other alerts I'd wire are failure-rate trending up as early warning, bulkhead capacity exhaustion, and retry storm detection."
+
+---
+
+### Q5 — Distributed CB state via Redis: design + trade-off
+
+呢條係 staff-level architecture design question — production 真實要諗。
+
+#### The problem restated
+
+```
+Instance 1   Instance 2   ...   Instance 10
+   ↓             ↓                  ↓
+            [product-service down]
+   ↓             ↓                  ↓
+CB trips     CB CLOSED         CB CLOSED
+fast-fail    slow-fail         slow-fail
+            (60s timeout)     (60s timeout)
+```
+
+Per-instance CB means **9/10 instances 仲喺度浪費 thread** until they each independently 累積足夠 failure samples to trip.
+
+Worst case math: if traffic round-robins evenly, every instance needs sliding-window-size = 10 failed samples → 100 total slow-fail requests across the cluster before all 10 instances trip. 60 秒 × 100 = potential 6000 thread-seconds wasted.
+
+#### Solution space
+
+| Approach | How | Pros | Cons |
+|---|---|---|---|
+| **A. Redis-backed shared state** | Every CB check/record hits Redis | Single source of truth — 1 instance trips all | +1 Redis hop per call (1-2ms); Redis death = CB state unknown |
+| **B. Sticky routing per downstream** | LB routes all product calls from cluster to a small pool of "gateway" instances | Gateway pool concentrates failures fast | Hot-spotting; gateway pool itself becomes SPOF |
+| **C. Service mesh CB (Envoy)** | mTLS sidecar implements outlier detection at network layer | Application-level zero code; works across languages | Less granular than Resilience4j; mesh adoption cost |
+| **D. Gossip-based propagation** | Instances broadcast CB trips to peers via gossip protocol | No central infrastructure; reasonably fast | Eventual consistency (slow propagation); complex impl |
+| **E. Just live with per-instance CB** ⭐ | Accept that first 30-60s of outage has uneven CB state | Zero complexity; "good enough" for most cases | Some wasted threads during early outage |
+
+#### Production reality — most teams pick E (per-instance)
+
+Until you're operating at hyper-scale (1000s of replicas, millions QPS), the trade-off looks like:
+
+```
+Per-instance CB cost:
+  Wasted thread-seconds during outage onset ≈ N × sliding-window × avg-call-latency
+  For 10 instances × 10 calls × 60s = 6000 thread-seconds = 100 minutes
+  ⚠️ Sounds bad but...
+
+Shared-state CB cost:
+  Latency tax: 1-2ms × QPS × 86400s/day
+  For 100 QPS × 1ms × 86400 = 8640 seconds/day = 144 minutes/day permanent overhead
+  PLUS Redis infrastructure cost + new failure mode (Redis down)
+```
+
+**One-time outage cost** vs **permanent latency tax** — per-instance usually wins.
+
+#### When shared state IS worth it
+
+3 scenarios:
+
+1. **Long-tail outages** — if downstream regularly degrades for 10+ minutes, the wasted-thread cost compounds.
+2. **Massive fan-out** — when 100+ instances call 1 downstream, per-instance "learning" wastes a lot of capacity.
+3. **Cost-critical downstream** — if downstream is expensive per call (paid API, slow ML inference), every wasted retry costs money.
+
+#### Sketch of Redis-backed CB (if you really need it)
+
+Resilience4j doesn't ship this — you'd build a custom `CircuitBreakerRegistry`:
+
+```java
+@Component
+public class RedisCircuitBreakerRegistry implements CircuitBreakerRegistry {
+
+    private final StringRedisTemplate redis;
+    private final CircuitBreakerRegistry localFallback;
+
+    @Override
+    public CircuitBreaker circuitBreaker(String name) {
+        return CircuitBreaker.of(name, () -> {
+            CircuitBreakerConfig cfg = configFromYaml(name);
+            return new RedisAwareCircuitBreaker(name, cfg, redis);
+        });
+    }
+}
+
+class RedisAwareCircuitBreaker extends AbstractCircuitBreaker {
+
+    @Override
+    public boolean tryAcquirePermission() {
+        // 1. Check Redis state (with local cache to reduce hops)
+        String state = redis.opsForValue().get("cb:" + name + ":state");
+        if ("OPEN".equals(state)) return false;
+        return super.tryAcquirePermission();
+    }
+
+    @Override
+    public void onError(...) {
+        super.onError(...);
+        // 2. Push state changes to Redis via pub/sub for peer notification
+        if (getState() == OPEN) {
+            redis.opsForValue().set("cb:" + name + ":state", "OPEN", Duration.ofSeconds(30));
+            redis.convertAndSend("cb:transitions", "OPEN:" + name);
+        }
+    }
+}
+```
+
+**Critical caveat**: Redis itself becomes a SPOF. You'd need a fail-open policy — if Redis is unreachable, **fall back to per-instance CB** rather than fail closed. Otherwise Redis outage =全 stack auth-style 404.
+
+#### 🎯 Interview talking point
+
+> "Per-instance circuit breaker is the default for a reason — it's zero-infrastructure and the only persistent overhead is the brief 'learning period' at the start of an outage. We chose to accept that cost rather than pay a 1-2ms Redis hop on every call. We'd reconsider for three scenarios: regular long-tail outages where wasted thread time compounds, massive fan-out where 100+ instances each need to learn independently, or expensive downstream calls where every retry costs real money. If we built a Redis-backed solution, the must-have is fail-open behavior on Redis outage — fall back to per-instance CB, never fail closed, otherwise Redis becomes a single point of failure for the entire resilience layer."
+
+---
+
+#### 🎯 Synthesis — Q1-Q5 之間嘅 link
+
+| Question | Connects to L8 codebase |
+|---|---|
+| Q1 (InventoryClient CB) | 完成 cart-service 嘅 resilience coverage — L8 只覆蓋 ProductClient |
+| Q2 (`@Bulkhead`) | 第 3 個 protection dimension — concurrency cap，補上 thread exhaustion 嘅最後缺口 |
+| Q3 (Tuning) | 答 "config 點揀" 嘅問題 — L8 yaml 嘅 number 全部係 demo 用，prod tuning 要 scenario-specific |
+| Q4 (Prometheus) | 將 L8 Phase 4 嘅 actuator endpoint 推上 industry-standard monitoring stack |
+| Q5 (Distributed CB) | Scaling 角度 — L8 design assume single instance，多 replica 嘅 trade-off 要 staff-level analysis |
+
+呢 5 條題目連起嚟 = **「Resilience4j 由 dev 落地 → production hardening」嘅 staff-level checklist**。L8 codebase 落地咗 ProductClient (CB + Retry + Fallback + Observability)，呢 5 條答案就係剩低 80% 嘅 production rigor — 完整 coverage、第 3 dimension protection、prod tuning judgement、monitoring + alerting、distributed CB trade-off。
+
+</details>
+
 ---
 
 ## 12. Next Lesson Preview — Lesson 09
