@@ -77,8 +77,9 @@ app:
   inventory-service:
     base-url: ${INVENTORY_SERVICE_URL:http://localhost:8083}
 
-# ===== Resilience4j (L8) =====
+# ===== Resilience4j (L8 / L9) =====
 # Each downstream gets its own CB instance so failures isolate per service.
+# Inventory dying should not trip product's CB and vice versa.
 resilience4j:
   circuitbreaker:
     instances:
@@ -104,6 +105,23 @@ resilience4j:
           - java.io.IOException
           - java.util.concurrent.TimeoutException
         # Don't count these as failures (404 = downstream alive, just no record)
+        ignore-exceptions:
+          - feign.FeignException$NotFound
+      # L9 warm-up — L8 hw Q1 落地. Same threshold knobs as productClient.
+      inventoryClient:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        record-exceptions:
+          - feign.FeignException
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
         ignore-exceptions:
           - feign.FeignException$NotFound
 
@@ -134,6 +152,26 @@ resilience4j:
           - java.net.SocketTimeoutException
           - java.io.IOException
         # NEVER retry these — pure waste of time.
+        ignore-exceptions:
+          - feign.FeignException$NotFound
+          - feign.FeignException$BadRequest
+          - feign.FeignException$Unauthorized
+          - feign.FeignException$Forbidden
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+      # L9 warm-up — same retry policy as productClient.
+      inventoryClient:
+        max-attempts: 3
+        wait-duration: 500ms
+        exponential-backoff-multiplier: 2
+        randomized-wait-factor: 0.3
+        retry-exceptions:
+          - feign.FeignException$InternalServerError
+          - feign.FeignException$BadGateway
+          - feign.FeignException$ServiceUnavailable
+          - feign.FeignException$GatewayTimeout
+          - feign.RetryableException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
         ignore-exceptions:
           - feign.FeignException$NotFound
           - feign.FeignException$BadRequest
