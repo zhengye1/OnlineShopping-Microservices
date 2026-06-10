@@ -69,6 +69,20 @@ spring:
     ansi:
       enabled: always
 
+app:
+  snowflake:
+    datacenter-id: 1
+    worker-id: 5                          # distinct from product (1), order (5)
+  kafka:
+    topic:
+      order-events: order-events                              # OrderCreated / OrderConfirmed / OrderCancelled
+      inventory-saga-events: inventory-saga-events            # StockReserved / StockReservationFailed
+      payment-events: payment-events                          # PaymentCharged / PaymentFailed
+  payment:
+    # Default Long.MAX_VALUE = no failure threshold. Test profile overrides
+    # to exercise the compensation path.
+    fail-above-cents: ${PAYMENT_FAIL_THRESHOLD_CENTS:9223372036854775807}
+
 # ===== Server =====
 server:
   port: 8085                            # user 8081 / product 8082 / inventory 8083 / cart 8084 / order 8085
