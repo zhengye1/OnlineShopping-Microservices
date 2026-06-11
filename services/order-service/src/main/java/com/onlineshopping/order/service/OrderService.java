@@ -4,6 +4,7 @@ import com.onlineshopping.order.dto.CreateOrderRequest;
 import com.onlineshopping.order.entity.Order;
 import com.onlineshopping.order.entity.OrderItem;
 import com.onlineshopping.order.entity.OrderStatus;
+import com.onlineshopping.order.event.CompensateReservationEvent;
 import com.onlineshopping.order.event.OrderCreatedEvent;
 import com.onlineshopping.order.repository.OrderRepository;
 import com.onlineshopping.order.snowflake.SnowflakeIdGenerator;
@@ -176,6 +177,18 @@ public class OrderService {
         orderRepo.save(order);
         log.info("Order PENDING_PAYMENT → CANCELLED (payment failed) — orderId={} reason={}",
                 orderId, reason);
-        // Compensation publishing happens in Phase 6.
+
+        // Compensation — release the inventory reservation we made in saga step 2.
+        // Published on order-events (the topic order-service owns) so inventory
+        // picks it up via the same OrderEventListener that handles
+        // OrderCreatedEvent — single consumer surface for all order lifecycle
+        // events, simpler topology than a dedicated compensation topic.
+        CompensateReservationEvent compensation = new CompensateReservationEvent(
+                UUID.randomUUID(), Instant.now(), orderId,
+                "PAYMENT_FAILED: " + reason
+        );
+        kafkaTemplate.send(orderEventsTopic, String.valueOf(orderId), compensation);
+        log.info("Published CompensateReservationEvent → topic={} orderId={}",
+                orderEventsTopic, orderId);
     }
 }

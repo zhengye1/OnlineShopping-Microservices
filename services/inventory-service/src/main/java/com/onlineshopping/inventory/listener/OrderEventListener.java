@@ -1,5 +1,6 @@
 package com.onlineshopping.inventory.listener;
 
+import com.onlineshopping.inventory.event.CompensateReservationEvent;
 import com.onlineshopping.inventory.event.OrderCreatedEvent;
 import com.onlineshopping.inventory.event.StockReservationFailedEvent;
 import com.onlineshopping.inventory.event.StockReservedEvent;
@@ -47,10 +48,37 @@ public class OrderEventListener {
     public void onOrderEvent(Object event, Acknowledgment ack) {
         if (event instanceof OrderCreatedEvent created) {
             handle(created);
+        } else if (event instanceof CompensateReservationEvent compensate) {
+            handleCompensation(compensate);
         } else {
             log.debug("OrderEventListener — ignoring event of type {}", event.getClass());
         }
         ack.acknowledge();
+    }
+
+    /**
+     * L9 Phase 6 compensation handler. Releases any ACTIVE reservations
+     * belonging to the order. Naturally idempotent — ReservationService
+     * filters to status=ACTIVE, so a redelivered compensation event for
+     * an already-released order is a no-op (logs warning, skips).
+     *
+     * <p>{@code reason} from upstream is preserved into
+     * {@code inventory_reservation.release_reason} so an SRE pulling up
+     * the row sees the full PAYMENT_FAILED context.
+     */
+    private void handleCompensation(CompensateReservationEvent event) {
+        log.info("Received CompensateReservationEvent orderId={} reason={}",
+                event.orderId(), event.reason());
+        try {
+            reservationService.releaseForOrder(event.orderId(), event.reason());
+            log.info("Compensation completed for orderId={}", event.orderId());
+        } catch (Exception e) {
+            // Don't ack on failure — let the listener container redeliver.
+            // releaseForOrder is idempotent (state-guard) so retries are safe.
+            log.error("Compensation FAILED for orderId={} — will redeliver",
+                    event.orderId(), e);
+            throw e;
+        }
     }
 
     private void handle(OrderCreatedEvent event) {
