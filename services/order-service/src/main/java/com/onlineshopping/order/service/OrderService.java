@@ -6,6 +6,7 @@ import com.onlineshopping.order.entity.OrderItem;
 import com.onlineshopping.order.entity.OrderStatus;
 import com.onlineshopping.order.event.CompensateReservationEvent;
 import com.onlineshopping.order.event.OrderCreatedEvent;
+import com.onlineshopping.order.event.PaymentRequestedEvent;
 import com.onlineshopping.order.repository.OrderRepository;
 import com.onlineshopping.order.snowflake.SnowflakeIdGenerator;
 import lombok.RequiredArgsConstructor;
@@ -50,6 +51,9 @@ public class OrderService {
 
     @Value("${app.kafka.topic.order-events}")
     private String orderEventsTopic;
+
+    @Value("${app.kafka.topic.payment-requests}")
+    private String paymentRequestsTopic;
 
     @Transactional
     public Order create(Long userId, CreateOrderRequest req, String idempotencyKey) {
@@ -125,6 +129,17 @@ public class OrderService {
         order.setStatus(OrderStatus.PENDING_PAYMENT);
         orderRepo.save(order);
         log.info("Order PENDING_INVENTORY → PENDING_PAYMENT — orderId={}", orderId);
+
+        // Serialize the saga: publish PaymentRequestedEvent AFTER the state
+        // transition so the eventual PaymentChargedEvent / PaymentFailedEvent
+        // cannot race with the upstream state machine.
+        PaymentRequestedEvent paymentRequested = new PaymentRequestedEvent(
+                UUID.randomUUID(), Instant.now(),
+                orderId, order.getTotalAmountCents(), order.getCurrency()
+        );
+        kafkaTemplate.send(paymentRequestsTopic, String.valueOf(orderId), paymentRequested);
+        log.info("Published PaymentRequestedEvent → topic={} orderId={} amount={} {}",
+                paymentRequestsTopic, orderId, order.getTotalAmountCents(), order.getCurrency());
     }
 
     @Transactional

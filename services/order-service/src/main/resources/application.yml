@@ -54,7 +54,10 @@ spring:
       auto-offset-reset: earliest
       enable-auto-commit: false
       properties:
-        spring.json.trusted.packages: "com.onlineshopping.common.events"
+        # Trust all our event packages — consumer-side JsonDeserializer
+        # resolves the typed class via the __TypeId__ header set by the
+        # producer. The package must be on the trusted list.
+        spring.json.trusted.packages: "com.onlineshopping.order.event,com.onlineshopping.common.events"
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
     producer:
@@ -75,8 +78,9 @@ app:
     worker-id: 5                          # distinct from product (1), order (5)
   kafka:
     topic:
-      order-events: order-events                              # OrderCreated / OrderConfirmed / OrderCancelled
+      order-events: order-events                              # OrderCreated / OrderConfirmed / OrderCancelled / CompensateReservation
       inventory-saga-events: inventory-saga-events            # StockReserved / StockReservationFailed
+      payment-requests: payment-requests                      # PaymentRequested (kicks off payment after PENDING_PAYMENT)
       payment-events: payment-events                          # PaymentCharged / PaymentFailed
   payment:
     # Default Long.MAX_VALUE = no failure threshold. Test profile overrides

@@ -19,7 +19,7 @@ CREATE TABLE orders (
     user_id             BIGINT NOT NULL,
     status              VARCHAR(32) NOT NULL,
     total_amount_cents  BIGINT NOT NULL,
-    currency            CHAR(3) NOT NULL,
+    currency            VARCHAR(3) NOT NULL,
     cancel_reason       VARCHAR(64) NULL,
     idempotency_key     VARCHAR(128) NULL,
     created_at          DATETIME(6) NOT NULL,
@@ -37,7 +37,7 @@ CREATE TABLE order_items (
     product_id            BIGINT NOT NULL,
     quantity              INT NOT NULL,
     price_at_order_cents  BIGINT NOT NULL,
-    currency              CHAR(3) NOT NULL,
+    currency              VARCHAR(3) NOT NULL,
 
     CONSTRAINT fk_order_items_order
         FOREIGN KEY (order_id) REFERENCES orders(id)

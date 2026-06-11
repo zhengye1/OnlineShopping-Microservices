@@ -8,6 +8,7 @@ import com.onlineshopping.inventory.service.ReservationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.Acknowledgment;
@@ -45,7 +46,8 @@ public class OrderEventListener {
 
     @KafkaListener(topics = "${app.kafka.topic.order-events}",
             groupId = "inventory-service-saga")
-    public void onOrderEvent(Object event, Acknowledgment ack) {
+    public void onOrderEvent(ConsumerRecord<String, Object> record, Acknowledgment ack) {
+        Object event = record.value();
         if (event instanceof OrderCreatedEvent created) {
             handle(created);
         } else if (event instanceof CompensateReservationEvent compensate) {

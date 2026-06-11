@@ -2,10 +2,11 @@ package com.onlineshopping.order.service;
 
 import com.onlineshopping.order.event.PaymentChargedEvent;
 import com.onlineshopping.order.event.PaymentFailedEvent;
-import com.onlineshopping.order.event.StockReservedEvent;
+import com.onlineshopping.order.event.PaymentRequestedEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.Acknowledgment;
@@ -46,28 +47,28 @@ public class PaymentMockService {
     @Value("${app.payment.fail-above-cents:9223372036854775807}")
     private long failAboveCents;
 
-    @KafkaListener(topics = "${app.kafka.topic.inventory-saga-events}",
+    @KafkaListener(topics = "${app.kafka.topic.payment-requests}",
             groupId = "payment-mock")
-    public void onInventoryEvent(Object event, Acknowledgment ack) {
-        if (event instanceof StockReservedEvent reserved) {
-            boolean shouldFail = reserved.totalAmountCents() > failAboveCents;
+    public void onPaymentRequest(ConsumerRecord<String, Object> record, Acknowledgment ack) {
+        Object event = record.value();
+        if (event instanceof PaymentRequestedEvent requested) {
+            boolean shouldFail = requested.amountCents() > failAboveCents;
             if (shouldFail) {
                 PaymentFailedEvent failedEvent = new PaymentFailedEvent(
                         UUID.randomUUID(), Instant.now(),
-                        reserved.orderId(), "SIMULATED_DECLINE");
-                kafkaTemplate.send(paymentTopic, String.valueOf(reserved.orderId()), failedEvent);
-                log.info("PaymentMock: published PaymentFailedEvent orderId={} (totalCents={} > threshold {})",
-                        reserved.orderId(), reserved.totalAmountCents(), failAboveCents);
+                        requested.orderId(), "SIMULATED_DECLINE");
+                kafkaTemplate.send(paymentTopic, String.valueOf(requested.orderId()), failedEvent);
+                log.info("PaymentMock: published PaymentFailedEvent orderId={} (amount={} > threshold {})",
+                        requested.orderId(), requested.amountCents(), failAboveCents);
             } else {
                 PaymentChargedEvent chargedEvent = new PaymentChargedEvent(
                         UUID.randomUUID(), Instant.now(),
-                        reserved.orderId(), reserved.totalAmountCents(), reserved.currency());
-                kafkaTemplate.send(paymentTopic, String.valueOf(reserved.orderId()), chargedEvent);
+                        requested.orderId(), requested.amountCents(), requested.currency());
+                kafkaTemplate.send(paymentTopic, String.valueOf(requested.orderId()), chargedEvent);
                 log.info("PaymentMock: published PaymentChargedEvent orderId={} amount={} {}",
-                        reserved.orderId(), reserved.totalAmountCents(), reserved.currency());
+                        requested.orderId(), requested.amountCents(), requested.currency());
             }
         }
-        // ignore other types
         ack.acknowledge();
     }
 }

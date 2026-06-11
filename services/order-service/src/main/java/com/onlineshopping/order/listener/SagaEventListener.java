@@ -7,6 +7,7 @@ import com.onlineshopping.order.event.StockReservedEvent;
 import com.onlineshopping.order.service.OrderService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
@@ -29,9 +30,11 @@ public class SagaEventListener {
 
     @KafkaListener(topics = "${app.kafka.topic.inventory-saga-events}",
             groupId = "order-service-inventory")
-    public void onInventorySagaEvent(Object event, Acknowledgment ack) {
-        // Spring Kafka deserializes to the @Header type-id by default; we
-        // accept Object and switch on runtime type for clarity.
+    public void onInventorySagaEvent(ConsumerRecord<String, Object> record, Acknowledgment ack) {
+        // Use ConsumerRecord<> to extract the deserialized value. Spring's
+        // default Object parameter binding gives us the raw ConsumerRecord
+        // (not the typed payload), so we extract value() explicitly.
+        Object event = record.value();
         if (event instanceof StockReservedEvent e) {
             log.info("Received StockReservedEvent orderId={}", e.orderId());
             orderService.handleStockReserved(e.orderId());
@@ -47,7 +50,8 @@ public class SagaEventListener {
 
     @KafkaListener(topics = "${app.kafka.topic.payment-events}",
             groupId = "order-service-payment")
-    public void onPaymentEvent(Object event, Acknowledgment ack) {
+    public void onPaymentEvent(ConsumerRecord<String, Object> record, Acknowledgment ack) {
+        Object event = record.value();
         if (event instanceof PaymentChargedEvent e) {
             log.info("Received PaymentChargedEvent orderId={} amount={} {}",
                     e.orderId(), e.amountCents(), e.currency());
