@@ -1,6 +1,6 @@
 package com.onlineshopping.cart.service;
 
-import com.onlineshopping.cart.client.InventoryClient;
+import com.onlineshopping.cart.client.ResilientInventoryClient;
 import com.onlineshopping.cart.client.InventoryStock;
 import com.onlineshopping.cart.client.ResilientProductClient;
 import com.onlineshopping.cart.client.ProductSummary;
@@ -38,7 +38,7 @@ class CartServiceTest {
     @Mock
     private ResilientProductClient productClient;
     @Mock
-    private InventoryClient inventoryClient;
+    private ResilientInventoryClient inventoryClient;
 
     @InjectMocks
     private CartService cartService;

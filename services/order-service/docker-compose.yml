@@ -1,0 +1,40 @@
+services:
+  order-mysql:
+    image: mysql:8.4
+    container_name: order_service_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: order_service
+      MYSQL_USER: order_service
+      MYSQL_PASSWORD: order_service_pw
+    ports:
+      - "3311:3306"
+    volumes:
+      - order_service_mysql_data:/var/lib/mysql
+    networks:
+      - order_service_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uorder_service", "-porder_service_pw"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  order-adminer:
+    image: adminer:latest
+    container_name: order_service_adminer
+    restart: unless-stopped
+    ports:
+      - "8094:8080"
+    networks:
+      - order_service_net
+    depends_on:
+      order-mysql:
+        condition: service_healthy
+
+volumes:
+  order_service_mysql_data:
+
+networks:
+  order_service_net:
+    driver: bridge

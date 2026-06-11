@@ -1,0 +1,28 @@
+# order-service integration test overrides
+# Testcontainers @ServiceConnection wires DataSource + Kafka at runtime.
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+  flyway:
+    enabled: true
+
+  # JWKS URI placeholder — NimbusJwtDecoder constructs lazily.
+  # Tests inject auth via @MockitoBean JwtDecoder + real Bearer header.
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:0/never-fetched
+
+logging:
+  level:
+    com.onlineshopping: DEBUG
+    org.testcontainers: INFO
+    org.apache.kafka: WARN
+
+app:
+  snowflake:
+    datacenter-id: 1
+    worker-id: 6                            # distinct from main (5) to detect test/prod ID collision smell

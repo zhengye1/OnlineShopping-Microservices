@@ -25,6 +25,15 @@ public class Inventory {
     @Builder.Default
     private Integer stockQuantity = 0;
 
+    /**
+     * Counter of stock currently held by ACTIVE reservations. Updated
+     * atomically alongside reservation INSERT/UPDATE. Available stock for
+     * new reservations = stock_quantity - reserved_stock.
+     */
+    @Column(name = "reserved_stock", nullable = false)
+    @Builder.Default
+    private Integer reservedStock = 0;
+
     @Version
     @Column(nullable = false)
     private Long version;

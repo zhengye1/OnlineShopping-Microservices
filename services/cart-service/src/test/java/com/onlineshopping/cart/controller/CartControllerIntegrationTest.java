@@ -43,6 +43,12 @@ class CartControllerIntegrationTest extends AbstractIntegrationTest {
                 .willReturn(aResponse().withStatus(503)));
     }
 
+    /** Stub inventory-service GET /inventory/{id} → 503 to simulate downstream outage. */
+    private void stubInventoryServiceDown(long productId) {
+        wireMock.stubFor(get(urlPathEqualTo("/inventory/" + productId))
+                .willReturn(aResponse().withStatus(503)));
+    }
+
     /** Stub product-service GET /products/{id} → 200 with a realistic body. */
     private void stubProductExists(long productId, long priceCents, String currency) {
         wireMock.stubFor(get(urlPathEqualTo("/products/" + productId))
@@ -245,6 +251,37 @@ class CartControllerIntegrationTest extends AbstractIntegrationTest {
         // Defense-in-depth: inventory-service was NOT called — short-circuit on
         // fallback miss before stock check (avoids unnecessary downstream load).
         wireMock.verify(0, getRequestedFor(urlPathEqualTo("/inventory/" + TEST_PRODUCT_ID)));
+    }
+
+    @Test
+    void addItem_inventoryServiceDown_returns503_evenWithExistingCart() throws Exception {
+        // GIVEN: user has an existing cart row (we DO have cached priceAtAddition).
+        // BUT: inventory degraded mode is fail-fast — unlike product, we can't
+        // trust a stale stock snapshot. cart_items never snapshotted stock.
+        cartItemRepo.save(CartItem.builder()
+                .userId(TEST_USER_ID)
+                .productId(TEST_PRODUCT_ID)
+                .quantity(1)
+                .priceAtAddition(5000L)
+                .currency("CAD")
+                .build());
+
+        // Product service healthy, inventory service down.
+        stubProductExists(TEST_PRODUCT_ID, 5000L, "CAD");
+        stubInventoryServiceDown(TEST_PRODUCT_ID);
+
+        String authHeader = mockJwtFor(TEST_USER_ID);
+        String body = addCartItemRequest(TEST_PRODUCT_ID, 1);
+
+        // THEN: 503 — we refuse rather than risk oversell at checkout. Even
+        // though we have a cart row (which works for product fallback), there
+        // is no safe stock fallback.
+        mockMvc.perform(post("/cart/items")
+                        .header("Authorization", authHeader)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.detail").value(containsString("Inventory service unavailable")));
     }
 
     @Test

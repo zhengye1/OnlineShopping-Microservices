@@ -1,0 +1,115 @@
+spring:
+  application:
+    name: order-service
+
+  # ===== DataSource (MySQL via docker-compose, port 3311) =====
+  datasource:
+    url: jdbc:mysql://localhost:3311/order_service?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: ${DB_USER:order_service}
+    password: ${DB_PASSWORD:order_service_pw}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+      max-lifetime: 1800000
+
+  # ===== JPA / Hibernate =====
+  jpa:
+    hibernate:
+      ddl-auto: validate                # Flyway controls schema, JPA validates mapping
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+        default_batch_fetch_size: 16
+    show-sql: false
+    open-in-view: false                  # production-grade — no OSIV
+
+  # ===== Flyway migration =====
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+
+  # ===== Security (JWT resource server — same pattern as cart/product/inventory) =====
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${JWT_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+
+  # ===== Error response: RFC 7807 ProblemDetail =====
+  mvc:
+    problemdetails:
+      enabled: true
+
+  # ===== Kafka (saga events) =====
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer:
+      group-id: order-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        # Trust all our event packages — consumer-side JsonDeserializer
+        # resolves the typed class via the __TypeId__ header set by the
+        # producer. The package must be on the trusted list.
+        spring.json.trusted.packages: "com.onlineshopping.order.event,com.onlineshopping.common.events"
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all                          # publish reliability — wait for in-sync replicas
+      retries: 3
+    listener:
+      ack-mode: MANUAL_IMMEDIATE         # match inventory-service L6 pattern
+
+  output:
+    ansi:
+      enabled: always
+
+app:
+  snowflake:
+    datacenter-id: 1
+    worker-id: 5                          # distinct from product (1), order (5)
+  kafka:
+    topic:
+      order-events: order-events                              # OrderCreated / OrderConfirmed / OrderCancelled / CompensateReservation
+      inventory-saga-events: inventory-saga-events            # StockReserved / StockReservationFailed
+      payment-requests: payment-requests                      # PaymentRequested (kicks off payment after PENDING_PAYMENT)
+      payment-events: payment-events                          # PaymentCharged / PaymentFailed
+  payment:
+    # Default Long.MAX_VALUE = no failure threshold. Test profile overrides
+    # to exercise the compensation path.
+    fail-above-cents: ${PAYMENT_FAIL_THRESHOLD_CENTS:9223372036854775807}
+
+# ===== Server =====
+server:
+  port: 8085                            # user 8081 / product 8082 / inventory 8083 / cart 8084 / order 8085
+  error:
+    include-message: always
+    include-binding-errors: always
+
+# ===== Logging =====
+logging:
+  pattern:
+    console: "%clr(%d{HH:mm:ss.SSS}){faint} %clr([%X{correlationId:-no-cid}]){magenta} %clr(%-5level)
+  %clr(%logger{36}){cyan} - %msg%n"
+  level:
+    com.onlineshopping: DEBUG
+    org.springframework.security: INFO
+    org.hibernate.SQL: INFO
+
+# ===== Actuator =====
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics
+  endpoint:
+    health:
+      show-details: always

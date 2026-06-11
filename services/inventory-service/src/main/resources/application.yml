@@ -65,4 +65,14 @@ logging:
 app:
   kafka:
     topic:
-      product-events: product-events  # 對齊 producer 嘅 topic name
+      product-events: product-events                       # L6 — Product catalog events
+      order-events: order-events                           # L9 — OrderCreated saga step 1
+      inventory-saga-events: inventory-saga-events         # L9 — StockReserved / StockReservationFailed
+  reservation:
+    # L9 saga — how long an ACTIVE reservation holds stock before TTL release.
+    # 15min matches Amazon / Stripe checkout conventions: gives the user a
+    # window to retry payment without forcing a full re-reserve.
+    ttl-minutes: ${RESERVATION_TTL_MINUTES:15}
+    # How often the TTL reaper sweeps. 60s = bounded latency for releasing
+    # expired reservations back to the available pool.
+    reaper-interval-ms: ${RESERVATION_REAPER_MS:60000}

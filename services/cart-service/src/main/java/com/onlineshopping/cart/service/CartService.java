@@ -1,8 +1,8 @@
 package com.onlineshopping.cart.service;
 
-import com.onlineshopping.cart.client.InventoryClient;
 import com.onlineshopping.cart.client.InventoryStock;
 import com.onlineshopping.cart.client.ProductSummary;
+import com.onlineshopping.cart.client.ResilientInventoryClient;
 import com.onlineshopping.cart.client.ResilientProductClient;
 import com.onlineshopping.cart.dto.AddCartItemRequest;
 import com.onlineshopping.cart.dto.CartItemResponse;
@@ -34,7 +34,7 @@ public class CartService {
 
     private final CartItemRepository cartItemRepo;
     private final ResilientProductClient productClient;
-    private final InventoryClient inventoryClient;
+    private final ResilientInventoryClient inventoryClient;
 
     @Transactional
     public CartItemResponse addItem(Long userId, AddCartItemRequest req) {
