@@ -632,6 +632,623 @@ What we **did not** build in L9, that real production would add:
 
 5. **Per-item partial reservation** — currently a single insufficient-stock item fails the WHOLE order. Real e-commerce sometimes allows partial fulfillment with user notification. Sketch the schema + saga changes needed to support "ship what's available, refund the rest."
 
+<details>
+<summary><strong>📖 Polished Solutions (L10 session fold-back)</strong></summary>
+
+> 小V 嘅 cold-attempt notes (final score 15/180 = 8%):
+> - **Q2 (15/30)**: Threshold direction 啱 (30min, defensible for B2C checkout). Senior gem: 自發 question "係唔係只能退款 because order cancelled" — 直接 catch 到 saga timeout 嘅 late-arriving payment race，呢個正係 staff-level engineer 嘅 instinct。但唔 aware of 兩個 alternative production pattern (two-phase probe + cancel-via-payment-API)。
+> - **Q1 / Q3 / Q4 / Q5 (0/150)**: Cold surrender — L9 hw 全部 production hands-on topic (outbox saga reliability, distributed CB extension, type-safe Kafka dispatch, partial fulfillment business logic)。冇做過 production saga 嘅人 cold-attempt 答唔到合理。
+> - 整體分數 L6 35→L7 26→L8 0→L9 15 — Q2 reverse 咗 L8 嘅 surrender，因為 saga timeout race 同 L6 嘅 transient-vs-permanent / L7 嘅 stale-cache 同一 family — 你開始 build production-incident instinct。
+
+---
+
+### Q1 — Outbox Pattern for `OrderService.create`
+
+#### The dual-write problem
+
+```java
+@Transactional
+public Order create(...) {
+    Order saved = orderRepo.save(order);                        // DB commit OK
+    kafkaTemplate.send(orderEventsTopic, ..., event);            // ⚠️ what if this fails?
+    return saved;
+}
+```
+
+兩個 system (MySQL + Kafka) 嘅 commit 唔可以 atomic — Spring `@Transactional` 只 cover MySQL。場景：
+
+| 失敗 sequence | 結果 |
+|---|---|
+| DB commit fails before send | Rollback, send doesn't happen — clean ✅ |
+| Send fails before DB commit | Transaction rolls back, no event sent — clean ✅ |
+| **DB commits → JVM crashes before send** | **Order persisted but event lost — saga stuck forever 🔥** |
+| **DB commits → Kafka broker down → send fails** | **Same as above** |
+
+第 3-4 種失敗係 **silent corruption** — 你 metrics 唔會 alarm，order 永遠 stuck 喺 PENDING_INVENTORY，要 manual SRE intervention。
+
+#### Outbox pattern: same-transaction durability
+
+> 將 event 寫入 **同一個 DB transaction**，再由 separate poller 將 outbox row drain 去 Kafka。Atomicity 由 MySQL transaction 保證。
+
+L6 product-service 已落地 — reference 嘅 OutboxEvent + OutboxPoller 直接 copy。
+
+```sql
+-- V2 migration for order-service
+CREATE TABLE outbox_event (
+    id              BIGINT PRIMARY KEY,                     -- Snowflake
+    aggregate_id    VARCHAR(64) NOT NULL,                   -- order ID for partitioning
+    event_type      VARCHAR(64) NOT NULL,
+    payload         JSON NOT NULL,                          -- serialized event
+    status          VARCHAR(16) NOT NULL DEFAULT 'PENDING', -- PENDING / PUBLISHED / FAILED
+    created_at      DATETIME(6) NOT NULL,
+    published_at    DATETIME(6) NULL,
+    retry_count     INT NOT NULL DEFAULT 0,
+
+    KEY idx_outbox_status_created (status, created_at)      -- poller scan
+);
+```
+
+#### Refactored OrderService.create
+
+```java
+@Transactional
+public Order create(Long userId, CreateOrderRequest req, String idempotencyKey) {
+    // ... idempotency check + entity build (unchanged) ...
+    Order saved = orderRepo.save(order);
+
+    // Persist event to outbox INSIDE the same transaction.
+    OrderCreatedEvent event = new OrderCreatedEvent(...);
+    outboxRepo.save(OutboxEvent.builder()
+        .id(snowflake.nextId())
+        .aggregateId(String.valueOf(saved.getId()))
+        .eventType("OrderCreated")
+        .payload(objectMapper.writeValueAsString(event))
+        .status(PENDING)
+        .build());
+
+    return saved;
+    // No more kafkaTemplate.send() here.
+}
+```
+
+#### Poller
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class OutboxPoller {
+    private final OutboxEventRepository outboxRepo;
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ObjectMapper objectMapper;
+
+    @Scheduled(fixedDelayString = "${app.outbox.poll-interval-ms:200}")
+    public void drain() {
+        List<OutboxEvent> pending = outboxRepo.findTop100ByStatusOrderByCreatedAtAsc(PENDING);
+        for (OutboxEvent e : pending) {
+            try {
+                kafkaTemplate.send(topicFor(e.getEventType()),
+                                   e.getAggregateId(), e.getPayload())
+                             .get();                              // synchronous — fail loudly
+                e.setStatus(PUBLISHED);
+                e.setPublishedAt(Instant.now());
+                outboxRepo.save(e);
+            } catch (Exception ex) {
+                e.setRetryCount(e.getRetryCount() + 1);
+                if (e.getRetryCount() >= 10) e.setStatus(FAILED);
+                outboxRepo.save(e);
+                log.error("Outbox publish failed for id={}", e.getId(), ex);
+            }
+        }
+    }
+}
+```
+
+#### Trade-off
+
+| Property | Without outbox | With outbox |
+|---|---|---|
+| **Atomicity** | None — dual write | DB transaction ✅ |
+| **Latency to Kafka** | < 5ms | 100-500ms (poll interval) |
+| **Lost events under crash** | possible | impossible ⭐ |
+| **Operational complexity** | low | +1 table + 1 poller + monitoring |
+| **Throughput** | bottlenecked by Kafka send | bottlenecked by poller batch size |
+
+#### What about CDC alternative (Debezium)?
+
+Debezium watches MySQL binlog and streams changes to Kafka — no poller code needed. Trade-off:
+
+- Pros: zero-application-code, lowest latency (~10ms binlog tail), exactly-once semantics with Kafka Connect
+- Cons: heavy infra (Kafka Connect cluster), schema registry needed, harder local dev
+- When: 100+ services with shared CDC infra. For our scale, in-app poller is right.
+
+#### 🎯 Interview金句
+
+> "Spring's @Transactional only covers a single resource — MySQL. Dual-writing to MySQL and Kafka in the same method is a silent reliability hole; a crash between the DB commit and the Kafka send loses the event. The outbox pattern brings the Kafka write back into the transaction by persisting the event payload to a DB table inside the same transaction, then a separate poller drains the outbox to Kafka. We accept ~200ms latency in exchange for zero lost events."
+
+---
+
+### Q2 — Saga Timeout + Late-Arriving Payment Race
+
+#### Two design decisions嘅 surface
+
+1. **What threshold?** depends on use case
+2. **What happens when timeout fires AFTER payment actually succeeded?** ← the trap
+
+#### Threshold mental model
+
+| Use case | Threshold | 點解 |
+|---|---|---|
+| **User-facing checkout** | 5-15 min | User UX — confirmation page can't wait |
+| **B2B order processing** | 30-60 min | Batch ok, less time-sensitive |
+| **Crypto / fraud-sensitive** | 60s - 2min | High-risk window must be short |
+| **Subscription renewal** | 24 hr | User not waiting at all |
+
+L9 checkout: **10 minutes**. Default for B2C.
+
+#### Scheduler implementation
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class SagaTimeoutReaper {
+    private final OrderRepository orderRepo;
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Value("${app.saga.timeout-minutes:10}")
+    private long timeoutMinutes;
+
+    @Scheduled(fixedDelayString = "${app.saga.reaper-interval-ms:60000}")
+    public void reapStuckOrders() {
+        Instant cutoff = Instant.now().minus(Duration.ofMinutes(timeoutMinutes));
+        List<Order> stuck = orderRepo.findStuckSince(
+            List.of(PENDING_INVENTORY, PENDING_PAYMENT), cutoff);
+
+        for (Order order : stuck) {
+            try {
+                timeoutSingleOrder(order);                       // own transaction
+            } catch (Exception e) {
+                log.error("Timeout reaper failed for orderId={}", order.getId(), e);
+            }
+        }
+    }
+
+    @Transactional
+    protected void timeoutSingleOrder(Order order) {
+        // Re-read inside transaction to dodge race with concurrent saga handler.
+        Order fresh = orderRepo.findById(order.getId()).orElse(null);
+        if (fresh == null || fresh.getStatus() == CONFIRMED || fresh.getStatus() == CANCELLED) {
+            return;                                              // already terminal
+        }
+
+        OrderStatus previousState = fresh.getStatus();
+        fresh.cancel("SAGA_TIMEOUT: stuck in " + previousState + " > " + timeoutMinutes + "min");
+        orderRepo.save(fresh);
+
+        if (previousState == PENDING_PAYMENT) {
+            // Stock was reserved — compensate.
+            kafkaTemplate.send(orderEventsTopic, String.valueOf(fresh.getId()),
+                new CompensateReservationEvent(UUID.randomUUID(), Instant.now(),
+                    fresh.getId(), "SAGA_TIMEOUT"));
+        }
+        // If PENDING_INVENTORY, nothing was reserved — no compensation needed.
+        log.warn("Order TIMEOUT_CANCELLED orderId={} from {} after {}min",
+            fresh.getId(), previousState, timeoutMinutes);
+    }
+}
+```
+
+#### The race: late-arriving PaymentChargedEvent
+
+```
+T=10:00:00  Order PENDING_PAYMENT
+T=10:00:01  Payment service is slow
+T=10:10:00  Timeout reaper fires:
+              Order → CANCELLED
+              Publish CompensateReservationEvent
+              Inventory reservation → RELEASED
+T=10:10:02  PaymentChargedEvent arrives (payment finally succeeded)
+            order-service.handlePaymentCharged:
+              Status check: order is CANCELLED, not PENDING_PAYMENT → IGNORED
+            But: 💳 user IS charged, 📦 inventory IS released
+            Outcome: user paid but no shipment
+```
+
+呢個 race 喺 production 一定會撞 — 唔係「會唔會」嘅問題，係「幾耐撞一次」。三個 patterns 處理：
+
+#### Pattern A: Refund flow (most common)
+
+```java
+@Transactional
+public void handlePaymentCharged(Long orderId) {
+    Order order = orderRepo.findById(orderId).orElse(null);
+    if (order == null) return;
+
+    if (order.getStatus() == CANCELLED && order.getCancelReason().startsWith("SAGA_TIMEOUT")) {
+        // Late-arriving charge against timed-out order. Refund + log incident.
+        log.error("Late PaymentChargedEvent for cancelled orderId={} — refunding", orderId);
+        kafkaTemplate.send(refundRequestsTopic, String.valueOf(orderId),
+            new RefundRequestedEvent(UUID.randomUUID(), Instant.now(),
+                orderId, order.getTotalAmountCents(), order.getCurrency(),
+                "LATE_PAYMENT_AFTER_TIMEOUT"));
+        return;
+    }
+
+    if (order.getStatus() != PENDING_PAYMENT) return;            // other transitions
+    order.setStatus(CONFIRMED);
+    orderRepo.save(order);
+}
+```
+
+Pros: simple, captures real $$$ flow. Cons: user got charged then refunded — bad UX (statement shows transient charge).
+
+#### Pattern B: Two-phase timeout
+
+```java
+PENDING_PAYMENT → (timeout 10min) → PENDING_PAYMENT_TIMEOUT_PROBE
+                                 ↓ (30s grace)
+                                 ↓
+                               either:
+                                 PaymentCharged arrives → CONFIRMED (saved at the wire!)
+                                 OR
+                                 grace expires → CANCELLED + Compensate
+```
+
+Add a fifth state `PENDING_PAYMENT_TIMEOUT_PROBE`. Reaper transitions to PROBE first, schedule another job 30s later to finalize. Pros: catches close-to-timeout payments. Cons: extra state, extra job, 30s extra payment-stuck window.
+
+#### Pattern C: Cancel-via-payment-API (most production-correct)
+
+```java
+@Transactional
+protected void timeoutSingleOrder(Order order) {
+    // Step 1: Tell payment-service to cancel the payment intent.
+    // This is idempotent — succeeds if payment is pending, FAILS if already charged.
+    try {
+        paymentService.cancelPaymentIntent(order.getId());
+    } catch (PaymentAlreadyChargedException e) {
+        // Payment succeeded between our timeout decision and our cancel call.
+        // Don't cancel the order — let the saga continue normally.
+        log.warn("Payment already charged at timeout for orderId={} — saga continues",
+            order.getId());
+        return;
+    }
+
+    // Step 2: Only NOW transition to CANCELLED and publish compensation.
+    order.cancel("SAGA_TIMEOUT");
+    orderRepo.save(order);
+    kafkaTemplate.send(orderEventsTopic, ..., new CompensateReservationEvent(...));
+}
+```
+
+Pros: no charge happens at all if we cancel in time. Cons: requires payment-service to support `cancel(intentId)` idempotently — Stripe / Adyen do, in-house may not.
+
+#### Production recommendation
+
+For our L9 mock saga: **Pattern A (Refund)** — easiest, captures most-common case, fits the choreography pattern. Real production with Stripe: **Pattern C** — cancel at the source if possible, fall through to refund if charge already happened.
+
+#### 🎯 Interview金句
+
+> "Saga timeout is straightforward — schedule a reaper to cancel orders stuck past threshold. The senior question is what happens when timeout fires but the payment actually succeeded right after. Three patterns: refund flow (late charge against CANCELLED order triggers automatic refund), two-phase timeout (probe state gives one more grace window), or cancel-via-payment-API (call Stripe's idempotent cancel first, fall through to refund only if already charged). Production usually combines them: try cancel first, fall back to refund. The bug to avoid is leaving the order CANCELLED while the charge happened — that's a missing refund on the user's statement."
+
+---
+
+### Q3 — CB + Retry on inventory-service Outbound (WMS API)
+
+#### Hypothetical: inventory-service calls Warehouse Management System
+
+Real e-commerce inventory needs to know **physical shelf location** for fulfillment routing. inventory-service makes outbound HTTP to a WMS:
+
+```
+inventory-service.reserve(productId, qty)
+   ├─ atomic UPDATE inventories
+   ├─ INSERT inventory_reservation
+   └─ HTTP POST WMS /shelf-lookup → confirm shelf has the SKU
+       │
+       (WMS is a 3rd-party SaaS — slow, occasionally flaky)
+```
+
+#### Why this calls for CB
+
+WMS slowness 同 inventory 反應 latency 直接掛鉤 — without CB, WMS downtime cascade 到 inventory-service Tomcat thread exhaust, cascade 到 cart-service Feign waiting on inventory.
+
+#### ResilientWmsClient design
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ResilientWmsClient {
+    private final WmsClient wmsClient;
+    private final InventoryReservationRepository reservationRepo;
+
+    @CircuitBreaker(name = "wmsClient", fallbackMethod = "verifyShelfFallback")
+    @Retry(name = "wmsClient")
+    public ShelfInfo verifyShelf(Long productId) {
+        return wmsClient.lookup(productId);
+    }
+
+    /**
+     * KEY DIFFERENCE from cart-side CB fallbacks: inventory-service can
+     * proceed with degraded info and flag the reservation for later
+     * manual review. Cart had to refuse (correctness > availability) but
+     * inventory can defer correctness check downstream.
+     */
+    public ShelfInfo verifyShelfFallback(Long productId, Throwable cause) {
+        log.warn("WMS unavailable for productId={} cause={} — proceeding with UNKNOWN shelf, "
+                + "reservation flagged for manual review",
+            productId, cause.getClass().getSimpleName());
+        return ShelfInfo.unknownLocation(productId);              // marker value
+    }
+}
+```
+
+#### The senior tweak — flag reservations for manual review
+
+```java
+// In ReservationService.reserve(...):
+ShelfInfo shelf = resilientWmsClient.verifyShelf(productId);
+boolean shelfUnknown = shelf.isUnknown();
+
+InventoryReservation reservation = InventoryReservation.builder()
+    .productId(productId)
+    // ... other fields ...
+    .needsManualReview(shelfUnknown)                            // ← new column
+    .reviewReason(shelfUnknown ? "WMS_UNAVAILABLE" : null)
+    .build();
+```
+
+Then a daily report flags `needs_manual_review=true` reservations — operations team verifies the inventory exists physically before shipment. **Degraded mode + observability is better than blocking** when downstream is slow.
+
+#### Why this DIFFERS from cart-side CB fallback
+
+| Layer | Failure mode |
+|---|---|
+| **Cart → inventory** | Refuse (correctness > availability) — cart can't allow oversell |
+| **Inventory → WMS** | Proceed-and-flag (availability > correctness) — order can ship later if shelf actually has it; manual review catches the edge |
+
+**Senior lesson**: degraded mode 嘅 acceptability 由 **downstream call 嘅 semantic** 決定。Cart-inventory 係 hard correctness boundary; inventory-WMS 係 optimization signal。
+
+#### 🎯 Interview金句
+
+> "Not every CB fallback should refuse. Cart's call to inventory must refuse on outage because the stock check is a hard correctness boundary — we can't allow oversells. Inventory's call to WMS is different — the shelf-lookup is an optimization, not a correctness boundary. We can proceed with an UNKNOWN-shelf marker, flag the reservation for manual review, and accept the operational cost. The principle is: classify the downstream call as hard-correctness or soft-optimization, and pick fallback accordingly."
+
+---
+
+### Q4 — `@KafkaHandler` for Type-Safe Dispatch
+
+#### Current pattern (L9 code) — instanceof switch
+
+```java
+@KafkaListener(topics = "${app.kafka.topic.order-events}", groupId = "...")
+public void onOrderEvent(ConsumerRecord<String, Object> record, Acknowledgment ack) {
+    Object event = record.value();
+    if (event instanceof OrderCreatedEvent created) {
+        handle(created);
+    } else if (event instanceof CompensateReservationEvent compensate) {
+        handleCompensation(compensate);
+    } else {
+        log.debug("Unknown event type: {}", event.getClass());
+    }
+    ack.acknowledge();
+}
+```
+
+Works, but:
+- No compile-time check that you handled all event types
+- `instanceof` chain grows linearly with event types
+- Hard to apply different concurrency / error handling per event type
+- Mixed concerns in one method body
+
+#### Refactored — class-level @KafkaListener + @KafkaHandler
+
+```java
+@Component
+@KafkaListener(topics = "${app.kafka.topic.order-events}",
+               groupId = "inventory-service-saga",
+               containerFactory = "kafkaListenerContainerFactory")
+@RequiredArgsConstructor
+@Slf4j
+public class OrderEventListener {
+
+    private final ReservationService reservationService;
+
+    @KafkaHandler
+    public void onOrderCreated(OrderCreatedEvent event, Acknowledgment ack) {
+        log.info("OrderCreated orderId={}", event.orderId());
+        // ... reserve stock ...
+        ack.acknowledge();
+    }
+
+    @KafkaHandler
+    public void onCompensation(CompensateReservationEvent event, Acknowledgment ack) {
+        log.info("Compensation orderId={}", event.orderId());
+        // ... release reservation ...
+        ack.acknowledge();
+    }
+
+    @KafkaHandler(isDefault = true)
+    public void onUnknown(@Payload Object event, Acknowledgment ack) {
+        log.warn("Unknown event type on order-events: {}", event.getClass());
+        ack.acknowledge();
+    }
+}
+```
+
+#### Pros / cons
+
+| Aspect | instanceof | @KafkaHandler |
+|---|---|---|
+| **Type safety** | runtime check | compile-time match |
+| **Adding new event type** | edit method, recompile, test | add new @KafkaHandler method, recompile |
+| **Default handler** | implicit (else branch) | explicit `isDefault=true` |
+| **Per-handler config** | impossible (single method) | possible (different @Async, error handlers) |
+| **Shared state across handlers** | easy (in same method) | medium (class-level fields) |
+| **Migration cost** | n/a | ~30 min for our 2 listener classes |
+
+#### Caveats
+
+- `@KafkaListener` must be on the **class**, not the methods. Existing code with method-level @KafkaListener needs full restructure.
+- `@KafkaHandler` requires the producer-side to set the `__TypeId__` header correctly — same trustedPackages constraint as before. If the type header is missing, ALL events route to `isDefault=true` handler.
+- Multiple @KafkaListener on the same class is allowed — useful when one class consumes multiple topics. Each topic group has its own @KafkaHandler resolution.
+
+#### Should we refactor L9?
+
+**Recommended yes** — type safety + cleaner per-handler error policies are worth the 30min refactor. The migration is mechanical and the tests verify correctness.
+
+#### 🎯 Interview金句
+
+> "`@KafkaHandler` gives you compile-time event-type dispatch instead of runtime instanceof. The class becomes a multi-method handler where Spring routes based on the deserialized payload's class. Pros are type safety and per-handler configuration. Cons are class-level @KafkaListener rigidity and the same trustedPackages dependency — if the type header is wrong, everything routes to the default handler. We'd refactor L9's two listener classes to this pattern for the next iteration."
+
+---
+
+### Q5 — Per-Item Partial Reservation
+
+#### The business problem
+
+User orders 5 items. Inventory has 3 of them, missing 2. Real e-commerce sometimes wants:
+- Ship the 3 available items now
+- Mark the 2 unavailable as backorder OR cancelled with notification
+- User pays only for what ships
+
+L9 implementation: any insufficient-stock item fails the WHOLE order (all-or-nothing). Production e-commerce 通常 prefer partial fulfillment for UX.
+
+#### Schema changes
+
+```sql
+-- OrderItem gets per-item status
+ALTER TABLE order_items
+    ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'PENDING',  -- PENDING / FULFILLED / UNAVAILABLE / BACKORDERED
+    ADD COLUMN unavailable_reason VARCHAR(64) NULL,
+    ADD COLUMN backorder_eta DATETIME(6) NULL;
+
+-- Order's total becomes "ordered total" with a "fulfilled total" separately tracked
+ALTER TABLE orders
+    ADD COLUMN fulfilled_amount_cents BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN partial_fulfillment BOOLEAN NOT NULL DEFAULT FALSE;
+```
+
+#### New saga events
+
+```java
+// Inventory publishes this instead of all-or-nothing
+public record StockPartiallyReservedEvent(
+    UUID eventId, Instant occurredAt,
+    Long orderId, Long userId,
+    List<ReservedItem> reserved,                                 // succeeded
+    List<UnavailableItem> unavailable,                          // failed
+    Long fulfillableAmountCents, String currency
+) implements DomainEvent {
+    public record ReservedItem(Long productId, Integer quantity) {}
+    public record UnavailableItem(Long productId, Integer requestedQty, Integer availableQty) {}
+}
+```
+
+#### Saga changes
+
+```java
+// inventory-service: reserve items independently
+public void handle(OrderCreatedEvent event) {
+    List<ReservedItem> reserved = new ArrayList<>();
+    List<UnavailableItem> unavailable = new ArrayList<>();
+
+    for (Item item : event.items()) {
+        try {
+            reservationService.reserve(item.productId(), event.userId(),
+                event.orderId(), item.quantity());
+            reserved.add(new ReservedItem(item.productId(), item.quantity()));
+        } catch (InsufficientStockException e) {
+            unavailable.add(new UnavailableItem(item.productId(),
+                item.quantity(), e.getAvailableQty()));
+        }
+    }
+
+    if (reserved.isEmpty()) {
+        // Nothing reservable — original saga path (all-failed cancellation).
+        publishStockReservationFailedEvent(event);
+        return;
+    }
+
+    long fulfillableAmount = reserved.stream()
+        .mapToLong(r -> findItemPrice(event, r.productId()) * r.quantity())
+        .sum();
+    publishStockPartiallyReservedEvent(event, reserved, unavailable, fulfillableAmount);
+}
+```
+
+#### Order-service handler updates
+
+```java
+@Transactional
+public void handlePartialReservation(StockPartiallyReservedEvent event) {
+    Order order = orderRepo.findById(event.orderId()).orElseThrow();
+    if (order.getStatus() != PENDING_INVENTORY) return;
+
+    // Mark each item's status
+    for (OrderItem item : order.getItems()) {
+        boolean isReserved = event.reserved().stream()
+            .anyMatch(r -> r.productId().equals(item.getProductId()));
+        item.setStatus(isReserved ? FULFILLED : UNAVAILABLE);
+        if (!isReserved) {
+            item.setUnavailableReason("INSUFFICIENT_STOCK");
+        }
+    }
+
+    order.setFulfilledAmountCents(event.fulfillableAmountCents());
+    order.setPartialFulfillment(true);
+    order.setStatus(PENDING_PAYMENT);
+    orderRepo.save(order);
+
+    // Charge only fulfilled amount.
+    kafkaTemplate.send(paymentRequestsTopic, String.valueOf(order.getId()),
+        new PaymentRequestedEvent(UUID.randomUUID(), Instant.now(),
+            order.getId(), event.fulfillableAmountCents(), event.currency()));
+
+    // Notify user of partial fulfillment.
+    kafkaTemplate.send(notificationsTopic, String.valueOf(order.getUserId()),
+        new PartialFulfillmentNoticeEvent(...));
+}
+```
+
+#### UX challenges
+
+1. **User consent** — POS / frontend needs a "Allow partial fulfillment?" checkbox at checkout. Without it, user expects all-or-nothing.
+2. **Re-confirmation flow** — some retailers prefer "we see 2 items unavailable, do you want to proceed with just 3?" — adds an extra HTTP round-trip but better UX.
+3. **Backorder vs cancel** — `BACKORDERED` status means "ship later"; needs ETA + supply-chain integration. Easier path: cancel unavailable items + notify user.
+4. **Refund for already-charged** — if charge already happened for ordered total and we discover unavailable post-fact, need refund-the-difference flow.
+
+#### Complexity vs benefit
+
+L9 happy path → partial fulfillment changes:
+- +2 schema fields per item
+- +2 schema fields per order
+- New event type (StockPartiallyReservedEvent)
+- 2 new handler methods
+- New notification event + topic
+- UX flow changes
+
+Probably ~+300 LOC + 1 new saga branch. Worth it only when the business clearly benefits from partial sales (Amazon does, niche luxury retailer doesn't).
+
+#### 🎯 Interview金句
+
+> "Partial fulfillment is more business logic than distributed systems — but it touches the saga in non-trivial ways. Each order item gets its own status (FULFILLED / UNAVAILABLE / BACKORDERED). The inventory side publishes StockPartiallyReservedEvent with per-item outcomes instead of all-or-nothing. The order's total splits into ordered_amount vs fulfilled_amount, and payment charges only the fulfilled portion. Big UX implications: user needs upfront consent for partial, then a notification when partial actually happens. The senior judgment call is whether the business needs this — Amazon yes, boutique retailer no — because the implementation cost is real."
+
+---
+
+#### 🎯 Synthesis — Q1-Q5 之間嘅 link
+
+| Question | Connects to L9 codebase |
+|---|---|
+| Q1 (Outbox) | 修補 OrderService.create 嘅 dual-write reliability hole — same pattern L6 product-service 已用 |
+| Q2 (Saga timeout) | 補完 saga 嘅 stuck-in-state recovery — TTL reaper already exists for reservation,呢個係 order-level version |
+| Q3 (CB on inventory outbound) | Extend L8 ResilientProductClient pattern + 教 hard-correctness vs soft-optimization fallback distinction |
+| Q4 (`@KafkaHandler`) | Refactor L9 嘅 4 個 instanceof switch listener 成 type-safe dispatch — quick win |
+| Q5 (Partial fulfillment) | Business-logic saga branch — 點 evolve choreography when "all-or-nothing" becomes "partial OK" |
+
+呢 5 條題目連起嚟 = **「Saga 由 happy-path demo → production-grade resilience + business flexibility」嘅 staff-level checklist**。L9 codebase 落地咗 baseline (state machine + atomic UPDATE + compensation + 5 integration tests)，呢 5 條答案就係剩低 80% 嘅 production hardening — dual-write atomicity、stuck-saga recovery、distributed CB extension、type-safe dispatch、partial fulfillment business logic。
+
+</details>
+
 ---
 
 ## 13. Next Lesson Preview — Lesson 10
